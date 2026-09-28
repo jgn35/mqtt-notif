@@ -44,6 +44,10 @@ def load_config(path: str) -> Config:
             raw = yaml.safe_load(stream)
     except FileNotFoundError as exc:
         raise ConfigError(f"Fichier de configuration introuvable : {path}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Configuration illisible : {path} : {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"Configuration illisible (UTF-8 attendu) : {path} : {exc}") from exc
     except yaml.YAMLError as exc:
         raise ConfigError(f"YAML invalide dans {path} : {exc}") from exc
 
@@ -57,6 +61,7 @@ def load_config(path: str) -> Config:
     host = broker.get("host")
     if not isinstance(host, str) or not host.strip():
         raise ConfigError("Clé manquante ou invalide : 'broker.host' (chaîne non vide attendue)")
+    host = host.strip()
 
     port = broker.get("port")
     if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
@@ -65,10 +70,16 @@ def load_config(path: str) -> Config:
     device_token = raw.get("device_token")
     if not isinstance(device_token, str) or not device_token.strip():
         raise ConfigError("Clé manquante ou invalide : 'device_token' (chaîne non vide attendue)")
+    device_token = device_token.strip()
 
     topic = raw.get("topic")
     if not isinstance(topic, str) or not topic.strip():
         raise ConfigError("Clé manquante ou invalide : 'topic' (chaîne non vide attendue)")
+    topic = topic.strip()
+    if "+" in topic or "#" in topic:
+        raise ConfigError("Topic invalide : motifs '+'/'#' non supportés (topic exact attendu)")
+    if " " in topic:
+        raise ConfigError("Topic invalide : espaces interdits")
 
     return Config(
         broker_host=host,

@@ -38,6 +38,44 @@ def test_missing_file(tmp_path):
         load_config(str(tmp_path / "absent.yaml"))
 
 
+def test_path_is_a_directory(tmp_path):
+    """Un chemin répertoire est une erreur explicite, pas un traceback brut."""
+    with pytest.raises(ConfigError, match="illisible"):
+        load_config(str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "topic, expected",
+    [
+        ("home/+/capteur", "Topic invalide"),
+        ("home/#", "Topic invalide"),
+        ("home/salon capteur", "Topic invalide"),
+    ],
+)
+def test_invalid_topic_syntax_rejected(tmp_path, topic, expected):
+    """Topic avec jokers ou espaces : rejet au démarrage (topic exact attendu en 1.1)."""
+    content = f"broker:\n  host: h\n  port: 1883\ndevice_token: t\ntopic: '{topic}'\n"
+    with pytest.raises(ConfigError, match=expected):
+        load_config(str(write_yaml(tmp_path, content)))
+
+
+def test_values_are_stripped(tmp_path):
+    """Les valeurs sont stockées débarrassées des espaces environnants."""
+    content = textwrap.dedent(
+        """\
+        broker:
+          host: '  localhost  '
+          port: 1883
+        device_token: '  tok  '
+        topic: '  home/salon  '
+        """
+    )
+    config = load_config(str(write_yaml(tmp_path, content)))
+    assert config.broker_host == "localhost"
+    assert config.device_token == "tok"
+    assert config.topic == "home/salon"
+
+
 def test_corrupt_yaml(tmp_path):
     with pytest.raises(ConfigError, match="YAML invalide"):
         load_config(str(write_yaml(tmp_path, "broker: [non, fermé\n  host: x")))
@@ -56,6 +94,8 @@ def test_non_mapping_root(tmp_path):
         ("broker:\n  port: 1883\ndevice_token: t\ntopic: a/b\n", "broker.host"),
         ("broker:\n  host: localhost\ndevice_token: t\ntopic: a/b\n", "broker.port"),
         ("broker:\n  host: localhost\n  port: pas_un_entier\ndevice_token: t\ntopic: a/b\n", "broker.port"),
+        ("broker:\n  host: localhost\n  port: true\ndevice_token: t\ntopic: a/b\n", "broker.port"),
+        ("broker:\n  host: localhost\n  port: 65536\ndevice_token: t\ntopic: a/b\n", "broker.port"),
         ("broker:\n  host: localhost\n  port: 0\ndevice_token: t\ntopic: a/b\n", "broker.port"),
         ("broker:\n  host: localhost\n  port: 1883\ntopic: a/b\n", "device_token"),
         ("broker:\n  host: localhost\n  port: 1883\ndevice_token: ''\ntopic: a/b\n", "device_token"),

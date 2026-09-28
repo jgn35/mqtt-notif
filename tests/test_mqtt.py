@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 
 import aiomqtt
 
+import mqtt_notif.mqtt as mqtt_module
 from mqtt_notif.mqtt import RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX, iter_messages, message_payload
 
 from .conftest import Episode, FakeMessage
@@ -114,18 +116,32 @@ async def test_backoff_capped(fake_broker, config, monkeypatch):
     assert max(recorded) == RECONNECT_BACKOFF_MAX
 
 
-async def test_stop_during_backoff_returns(fake_broker, config):
-    """Stop déclenché pendant l'attente de reconnexion : sortie propre immédiate."""
-    episodes, _clients = fake_broker
-    episodes.append(Episode(drop=aiomqtt.MqttError("coupé")))
+async def test_stop_during_backoff_returns(fake_broker, config, monkeypatch, capsys):
+    """Stop pendant l'attente de reconnexion : retour propre bien avant l'expiration."""
+    episodes, _clients = fake_broker  # épuisé : chaque connexion est refusée
+    monkeypatch.setattr(mqtt_module, "RECONNECT_BACKOFF_INITIAL", 10.0)
     stop = asyncio.Event()
+
+    async def consume():
+        async for _message in iter_messages(config, stop):
+            pass
+
+    task = asyncio.create_task(consume())
+    # Attendre que la boucle entre réellement dans l'attente de backoff.
+    seen = ""
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+        seen += capsys.readouterr().out
+        if "retry in" in seen:
+            break
+    assert "retry in 10.0s" in seen
+
     stop.set()
-
-    got = []
-    async for message in iter_messages(config, stop):
-        got.append(message)
-
-    assert got == []
+    start = time.monotonic()
+    await asyncio.wait_for(task, timeout=2)
+    # Retour immédiat : bien avant les 10s du backoff en cours.
+    assert time.monotonic() - start < 5
 
 
 def test_message_payload_decodes_bytes_and_text():

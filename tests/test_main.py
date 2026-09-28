@@ -15,6 +15,7 @@ import time
 import aiomqtt
 import pytest
 
+import mqtt_notif.main as main_module
 import mqtt_notif.mqtt as mqtt_module
 from mqtt_notif.main import main, run_pipeline, serve
 
@@ -85,6 +86,58 @@ async def test_sigterm_stops_serve_cleanly(fake_broker, config, capsys):
 
     out = capsys.readouterr().out
     assert "stopped cleanly" in out
+
+
+async def test_pipeline_error_logged_and_restarted(config, monkeypatch, capsys):
+    """Erreur interne du pipeline : journalisée, pipeline relancé, pas de propagation."""
+    monkeypatch.setattr(main_module, "RESTART_DELAY_S", 0)
+    calls = []
+
+    async def flaky_iter_messages(config, stop):
+        calls.append("call")
+        if len(calls) == 1:
+            raise ValueError("bug interne")
+        yield FakeMessage(b"x")
+        stop.set()
+
+    monkeypatch.setattr(main_module, "iter_messages", flaky_iter_messages)
+    notifier = SlowNotifier(delay=0.01)
+
+    await asyncio.wait_for(serve(config, notifier), timeout=5)
+
+    out = capsys.readouterr().out
+    assert "pipeline error (restarting)" in out
+    assert "bug interne" in out
+    assert len(calls) == 2
+    assert "stopped cleanly" in out
+
+
+async def test_shutdown_drain_is_bounded(config, monkeypatch, capsys):
+    """SHUTDOWN_TIMEOUT_S expiré : les envois récalcitrants sont annulés et journalisés."""
+    monkeypatch.setattr(main_module, "SHUTDOWN_TIMEOUT_S", 0.05)
+
+    class StuckNotifier:
+        def __init__(self):
+            self.calls = 0
+
+        async def notify(self):
+            self.calls += 1
+            await asyncio.Event().wait()  # ne se termine jamais seul
+
+    notifier = StuckNotifier()
+    stop = asyncio.Event()
+
+    async def one_message_iter(config, stop):
+        yield FakeMessage(b"1")
+        stop.set()
+
+    monkeypatch.setattr(main_module, "iter_messages", one_message_iter)
+
+    await asyncio.wait_for(run_pipeline(config, notifier, stop), timeout=2)
+
+    assert notifier.calls == 1
+    out = capsys.readouterr().out
+    assert "fcm sends abandoned" in out
 
 
 def test_main_returns_zero_on_valid_config(fake_broker, monkeypatch, tmp_path, capsys):
