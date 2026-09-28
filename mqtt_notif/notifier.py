@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 
 import firebase_admin
 from firebase_admin import credentials, messaging
@@ -26,6 +27,7 @@ class Notifier:
     def __init__(self, device_token: str) -> None:
         self._device_token = device_token
         self._app: firebase_admin.App | None = None
+        self._init_lock = threading.Lock()
 
     async def notify(self) -> None:
         """Déclenche l'envoi du message FCM fixe dans un thread via to_thread.
@@ -59,15 +61,20 @@ class Notifier:
         messaging.send(message, app=app)
 
     def _get_app(self) -> firebase_admin.App:
-        """Initialise (une fois) l'app firebase-admin depuis la variable d'environnement."""
-        if self._app is not None:
+        """Initialise (une fois) l'app firebase-admin depuis la variable d'environnement.
+
+        Verrouillé : plusieurs envoi concurrents (to_thread) ne doivent jamais
+        appeler initialize_app en double — firebase-admin lèverait ValueError.
+        """
+        with self._init_lock:
+            if self._app is not None:
+                return self._app
+            path = os.environ.get(CREDENTIALS_ENV)
+            if not path:
+                raise RuntimeError(
+                    f"Variable d'environnement {CREDENTIALS_ENV} absente : "
+                    "identifiants firebase requis pour l'envoi"
+                )
+            credential = credentials.Certificate(path)
+            self._app = firebase_admin.initialize_app(credential)
             return self._app
-        path = os.environ.get(CREDENTIALS_ENV)
-        if not path:
-            raise RuntimeError(
-                f"Variable d'environnement {CREDENTIALS_ENV} absente : "
-                "identifiants firebase requis pour l'envoi"
-            )
-        credential = credentials.Certificate(path)
-        self._app = firebase_admin.initialize_app(credential)
-        return self._app
