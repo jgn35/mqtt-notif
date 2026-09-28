@@ -1,5 +1,4 @@
-"""AC-1.2.1 : YAML absent/corrompu/clé manquante -> échec rapide, message explicite.
-AC-1.2.1 : section rules validée au chargement (nom unique non vide, motif légal)."""
+"""AC-1.1.7 : YAML absent/corrompu/clé manquante -> échec rapide, message explicite."""
 
 from __future__ import annotations
 
@@ -15,13 +14,7 @@ VALID_YAML = textwrap.dedent(
       host: localhost
       port: 1883
     device_token: abc123
-    rules:
-      - name: capteur-salon
-        topic: home/salon/capteur
-      - name: bouton-niveau
-        topic: home/+/bouton
-      - name: maison-entiere
-        topic: home/#
+    topic: home/salon/capteur
     """
 )
 
@@ -37,16 +30,7 @@ def test_valid_yaml_loads(tmp_path):
     assert config.broker_host == "localhost"
     assert config.broker_port == 1883
     assert config.device_token == "abc123"
-    assert [rule.name for rule in config.rules] == [
-        "capteur-salon",
-        "bouton-niveau",
-        "maison-entiere",
-    ]
-    assert [rule.topic for rule in config.rules] == [
-        "home/salon/capteur",
-        "home/+/bouton",
-        "home/#",
-    ]
+    assert config.topic == "home/salon/capteur"
 
 
 def test_missing_file(tmp_path):
@@ -61,110 +45,17 @@ def test_path_is_a_directory(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "topic",
+    "topic, expected",
     [
-        "home/salon/capteur",
-        "home/+/bouton",
-        "home/#",
-        "#",
-        "+",
+        ("home/+/capteur", "Topic invalide"),
+        ("home/#", "Topic invalide"),
+        ("home/salon capteur", "Topic invalide"),
     ],
 )
-def test_wildcard_patterns_now_accepted(tmp_path, topic):
-    """Les motifs '+'/'#' sont légaux depuis 1.2 (l'interdit était le comportement 1.1)."""
-    content = (
-        "broker:\n  host: h\n  port: 1883\ndevice_token: t\n"
-        f"rules:\n  - name: r\n    topic: '{topic}'\n"
-    )
-    config = load_config(str(write_yaml(tmp_path, content)))
-    assert config.rules[0].topic == topic
-
-
-@pytest.mark.parametrize(
-    "topic",
-    [
-        "home/#/capteur",  # '#' pas au dernier niveau
-        "home/capteur#",  # '#' collé à autre chose
-        "home/+capteur",  # '+' pas un niveau entier
-        "home/ca+pteur",  # '+' en plein milieu de niveau
-        "home/salon capteur",  # espaces
-        "home//capteur",  # niveau vide
-        "/home",  # niveau vide en tête
-        "home/",  # niveau vide en queue
-    ],
-)
-def test_invalid_topic_syntax_rejected_citing_rule(tmp_path, topic):
-    """Motif illégal : rejet au démarrage, erreur citant la règle fautive."""
-    content = (
-        "broker:\n  host: h\n  port: 1883\ndevice_token: t\n"
-        f"rules:\n  - name: regle-fautive\n    topic: '{topic}'\n"
-    )
-    with pytest.raises(ConfigError, match="regle-fautive"):
-        load_config(str(write_yaml(tmp_path, content)))
-
-
-def test_rule_without_topic_rejected_citing_rule_name(tmp_path):
-    """Règle sans topic : erreur citant la règle fautive."""
-    content = textwrap.dedent(
-        """\
-        broker:
-          host: h
-          port: 1883
-        device_token: t
-        rules:
-          - name: bonne
-            topic: home/a
-          - name: fautive-sans-topic
-        """
-    )
-    with pytest.raises(ConfigError, match="fautive-sans-topic"):
-        load_config(str(write_yaml(tmp_path, content)))
-
-
-def test_empty_rule_name_rejected(tmp_path):
-    content = (
-        "broker:\n  host: h\n  port: 1883\ndevice_token: t\n"
-        "rules:\n  - name: ''\n    topic: home/a\n"
-    )
-    with pytest.raises(ConfigError, match="'name'"):
-        load_config(str(write_yaml(tmp_path, content)))
-
-
-def test_missing_rule_name_rejected(tmp_path):
-    content = (
-        "broker:\n  host: h\n  port: 1883\ndevice_token: t\n"
-        "rules:\n  - topic: home/a\n"
-    )
-    with pytest.raises(ConfigError, match="Règle #1"):
-        load_config(str(write_yaml(tmp_path, content)))
-
-
-def test_duplicate_rule_name_rejected_citing_name(tmp_path):
-    content = textwrap.dedent(
-        """\
-        broker:
-          host: h
-          port: 1883
-        device_token: t
-        rules:
-          - name: doublon
-            topic: home/a
-          - name: autre
-            topic: home/b
-          - name: doublon
-            topic: home/c
-        """
-    )
-    with pytest.raises(ConfigError, match="doublon.*dupliqué"):
-        load_config(str(write_yaml(tmp_path, content)))
-
-
-def test_rule_not_a_mapping_rejected(tmp_path):
-    content = (
-        "broker:\n  host: h\n  port: 1883\ndevice_token: t\n"
-        "rules:\n  - juste_une_chaine\n"
-    )
-    with pytest.raises(ConfigError, match="Règle #1"):
+def test_invalid_topic_syntax_rejected(tmp_path, topic, expected):
+    """Topic avec jokers ou espaces : rejet au démarrage (topic exact attendu en 1.1)."""
+    content = f"broker:\n  host: h\n  port: 1883\ndevice_token: t\ntopic: '{topic}'\n"
+    with pytest.raises(ConfigError, match=expected):
         load_config(str(write_yaml(tmp_path, content)))
 
 
@@ -176,16 +67,13 @@ def test_values_are_stripped(tmp_path):
           host: '  localhost  '
           port: 1883
         device_token: '  tok  '
-        rules:
-          - name: '  capteur  '
-            topic: '  home/salon  '
+        topic: '  home/salon  '
         """
     )
     config = load_config(str(write_yaml(tmp_path, content)))
     assert config.broker_host == "localhost"
     assert config.device_token == "tok"
-    assert config.rules[0].name == "capteur"
-    assert config.rules[0].topic == "home/salon"
+    assert config.topic == "home/salon"
 
 
 def test_corrupt_yaml(tmp_path):
@@ -201,19 +89,17 @@ def test_non_mapping_root(tmp_path):
 @pytest.mark.parametrize(
     "content, expected",
     [
-        ("port: 1883\ndevice_token: t\nrules: []\n", "'broker'"),
-        ("host: localhost\nport: 1883\ndevice_token: t\nrules: []\n", "'broker'"),
-        ("broker:\n  port: 1883\ndevice_token: t\nrules: []\n", "broker.host"),
-        ("broker:\n  host: localhost\ndevice_token: t\nrules: []\n", "broker.port"),
-        ("broker:\n  host: localhost\n  port: pas_un_entier\ndevice_token: t\nrules: []\n", "broker.port"),
-        ("broker:\n  host: localhost\n  port: true\ndevice_token: t\nrules: []\n", "broker.port"),
-        ("broker:\n  host: localhost\n  port: 65536\ndevice_token: t\nrules: []\n", "broker.port"),
-        ("broker:\n  host: localhost\n  port: 0\ndevice_token: t\nrules: []\n", "broker.port"),
-        ("broker:\n  host: localhost\n  port: 1883\nrules: []\n", "device_token"),
-        ("broker:\n  host: localhost\n  port: 1883\ndevice_token: ''\nrules: []\n", "device_token"),
-        ("broker:\n  host: localhost\n  port: 1883\ndevice_token: t\n", "'rules'"),
-        ("broker:\n  host: localhost\n  port: 1883\ndevice_token: t\nrules: pas_une_liste\n", "'rules'"),
-        ("broker:\n  host: localhost\n  port: 1883\ndevice_token: t\nrules: []\n", "'rules'"),
+        ("port: 1883\ndevice_token: t\ntopic: a/b\n", "'broker'"),
+        ("host: localhost\nport: 1883\ndevice_token: t\ntopic: a/b\n", "'broker'"),
+        ("broker:\n  port: 1883\ndevice_token: t\ntopic: a/b\n", "broker.host"),
+        ("broker:\n  host: localhost\ndevice_token: t\ntopic: a/b\n", "broker.port"),
+        ("broker:\n  host: localhost\n  port: pas_un_entier\ndevice_token: t\ntopic: a/b\n", "broker.port"),
+        ("broker:\n  host: localhost\n  port: true\ndevice_token: t\ntopic: a/b\n", "broker.port"),
+        ("broker:\n  host: localhost\n  port: 65536\ndevice_token: t\ntopic: a/b\n", "broker.port"),
+        ("broker:\n  host: localhost\n  port: 0\ndevice_token: t\ntopic: a/b\n", "broker.port"),
+        ("broker:\n  host: localhost\n  port: 1883\ntopic: a/b\n", "device_token"),
+        ("broker:\n  host: localhost\n  port: 1883\ndevice_token: ''\ntopic: a/b\n", "device_token"),
+        ("broker:\n  host: localhost\n  port: 1883\ndevice_token: t\n", "'topic'"),
     ],
 )
 def test_missing_or_invalid_keys(tmp_path, content, expected):
