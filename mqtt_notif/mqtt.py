@@ -14,6 +14,7 @@ import aiomqtt
 
 from . import log_line
 from .config import Config
+from .rules import minimal_subscription_topics
 
 RECONNECT_BACKOFF_INITIAL = 1.0
 RECONNECT_BACKOFF_MAX = 60.0
@@ -30,12 +31,14 @@ def message_payload(message: aiomqtt.Message) -> str:
 async def iter_messages(
     config: Config, stop: asyncio.Event
 ) -> AsyncIterator[aiomqtt.Message]:
-    """Itère les messages du topic souscrit ; reconnexion auto à backoff croissant.
+    """Itère les messages des topics souscrits ; reconnexion auto à backoff croissant.
 
     Retourne uniquement quand `stop` est déclenché (arrêt propre SIGTERM/SIGINT).
     Une erreur broker après le premier démarrage ne termine jamais l'itération :
     déconnexion journalisée, attente exponentielle bornée, puis reconnexion.
     """
+    topics = minimal_subscription_topics(config.rules)
+    topics_log = ",".join(topics)
     backoff = RECONNECT_BACKOFF_INITIAL
     ever_connected = False
     while not stop.is_set():
@@ -47,11 +50,12 @@ async def iter_messages(
                 log_line(
                     f"mqtt {'reconnected' if ever_connected else 'connected'} "
                     f"{config.broker_host}:{config.broker_port} "
-                    f"topic={config.topic} qos=0"
+                    f"topics={topics_log} qos=0"
                 )
                 ever_connected = True
                 backoff = RECONNECT_BACKOFF_INITIAL
-                await client.subscribe(config.topic, qos=0)
+                for filter_topic in topics:
+                    await client.subscribe(filter_topic, qos=0)
                 async for message in client.messages:
                     if stop.is_set():
                         return

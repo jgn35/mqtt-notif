@@ -1,4 +1,5 @@
-"""AC-1.1.1 / AC-1.1.3 : connexion, souscription QoS 0, logs de cycle de vie,
+"""AC-1.1.1 / AC-1.1.3 / AC-1.2.2 : connexion, souscriptions QoS 0 de
+l'ensemble des topics des règles (couverture minimale), logs de cycle de vie,
 reconnexion automatique à backoff croissant, jamais d'arrêt spontané."""
 
 from __future__ import annotations
@@ -10,7 +11,9 @@ import time
 import aiomqtt
 
 import mqtt_notif.mqtt as mqtt_module
+from mqtt_notif.config import Config
 from mqtt_notif.mqtt import RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX, iter_messages, message_payload
+from mqtt_notif.rules import Rule
 
 from .conftest import Episode, FakeMessage
 
@@ -33,11 +36,59 @@ async def test_connect_subscribe_and_log(fake_broker, config, capsys):
         stop.set()
 
     assert got == ["hello"]
-    assert clients[0].subscribed == [(config.topic, 0)]
+    assert clients[0].subscribed == [(config.rules[0].topic, 0)]
     out = get_lines(capsys)
     assert ISO_UTC.match(out[0])
     assert f"mqtt connected {config.broker_host}:{config.broker_port}" in out[0]
-    assert f"topic={config.topic} qos=0" in out[0]
+    assert f"topics={config.rules[0].topic} qos=0" in out[0]
+
+
+async def test_subscribe_all_rule_topics(fake_broker, capsys):
+    """AC-1.2.2 : souscription QoS 0 à l'ensemble des topics des règles."""
+    episodes, clients = fake_broker
+    config = Config(
+        broker_host="localhost",
+        broker_port=1883,
+        device_token="t",
+        rules=(
+            Rule(name="a", topic="home/salon/capteur"),
+            Rule(name="b", topic="home/+/bouton"),
+            Rule(name="c", topic="garage/porte"),
+        ),
+    )
+    episodes.append(Episode(messages=[FakeMessage(b"x")], drop=aiomqtt.MqttError("drop")))
+    stop = asyncio.Event()
+
+    async for _message in iter_messages(config, stop):
+        stop.set()
+
+    assert clients[0].subscribed == [
+        ("home/salon/capteur", 0),
+        ("home/+/bouton", 0),
+        ("garage/porte", 0),
+    ]
+
+
+async def test_overlapping_rules_subscribe_minimal_coverage(fake_broker):
+    """AC-1.2.2 : filtres chevauchants -> couverture minimale, une seule livraison par message."""
+    episodes, clients = fake_broker
+    config = Config(
+        broker_host="localhost",
+        broker_port=1883,
+        device_token="t",
+        rules=(
+            Rule(name="exact", topic="home/salon/capteur"),
+            Rule(name="motif", topic="home/+/capteur"),
+            Rule(name="tout", topic="home/#"),
+        ),
+    )
+    episodes.append(Episode(messages=[FakeMessage(b"x")], drop=aiomqtt.MqttError("drop")))
+    stop = asyncio.Event()
+
+    async for _message in iter_messages(config, stop):
+        stop.set()
+
+    assert clients[0].subscribed == [("home/#", 0)]
 
 
 async def test_reconnect_after_drop(fake_broker, config, capsys):

@@ -8,6 +8,7 @@ import aiomqtt
 import pytest
 
 from mqtt_notif.config import Config
+from mqtt_notif.rules import Rule
 
 
 class FakeMessage:
@@ -98,5 +99,5 @@ def config() -> Config:
         broker_host="localhost",
         broker_port=1883,
         device_token="token-test-1234",
-        topic="home/salon/capteur",
+        rules=(Rule(name="capteur", topic="home/salon/capteur"),),
     )
