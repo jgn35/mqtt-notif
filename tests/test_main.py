@@ -1,8 +1,11 @@
-"""AC-1.1.5 / AC-1.1.6 : assemblage, tâche d'envoi indépendante, SIGTERM -> exit 0."""
+"""AC-1.1.5 / AC-1.1.6 / AC-1.2.3 / AC-1.2.5 / AC-1.2.6 : assemblage,
+sélection première-gagnante, événement immuable, tâche d'envoi indépendante,
+SIGTERM -> exit 0."""
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import select
 import signal
@@ -17,11 +20,21 @@ import pytest
 
 import mqtt_notif.main as main_module
 import mqtt_notif.mqtt as mqtt_module
-from mqtt_notif.main import main, run_pipeline, serve
+from mqtt_notif.config import Config
+from mqtt_notif.main import build_event, main, run_pipeline, serve
+from mqtt_notif.rules import Rule
 
 from .conftest import Episode, FakeMessage
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+RULES_YAML = textwrap.dedent(
+    """\
+    rules:
+      - name: salon
+        topic: home/salon/capteur
+    """
+)
 
 
 class SlowNotifier:
@@ -42,6 +55,16 @@ class SlowNotifier:
         self.finished.append(time.monotonic())
         if len(self.finished) >= 3:
             self.all_sent.set()
+
+
+class CountingNotifier:
+    """Notifier compteur : une notification = un appel notify()."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def notify(self):
+        self.calls += 1
 
 
 async def test_slow_send_does_not_block_pipeline(fake_broker, config, monkeypatch):
@@ -71,6 +94,109 @@ async def test_slow_send_does_not_block_pipeline(fake_broker, config, monkeypatc
     assert max(notifier.started) < min(notifier.finished)
     # Concurrent et non séquentiel : bien plus rapide que 3 x delay.
     assert elapsed < 3 * notifier.delay
+
+
+def test_build_event_first_wins_with_multi_match_warning(capsys):
+    """AC-1.2.3 / AC-1.2.5 : deux règles couvrent le message -> première traite, avertissement."""
+    rules = (
+        Rule(name="capteur", topic="home/+/capteur"),
+        Rule(name="salon", topic="home/salon/+"),
+    )
+    event = build_event(rules, "home/salon/capteur", "brut")
+    assert event.topic == "home/salon/capteur"
+    assert event.payload == "brut"
+    assert event.rule == rules[0]
+    out = capsys.readouterr().out
+    assert "warning" in out
+    assert "2 règles correspondent" in out
+    assert "rule=capteur" in out
+
+
+def test_build_event_single_match_no_warning(capsys):
+    rules = (Rule(name="capteur", topic="home/+/capteur"), Rule(name="garage", topic="garage/#"))
+    event = build_event(rules, "home/bureau/capteur", "p")
+    assert event.rule.name == "capteur"
+    assert "warning" not in capsys.readouterr().out
+
+
+def test_build_event_no_match_returns_none(capsys):
+    event = build_event((Rule(name="salon", topic="home/salon/capteur"),), "home/cave/temp", "p")
+    assert event is None
+
+
+def test_event_is_frozen(config):
+    """AC-1.2.6 : l'événement et sa règle sont immuables — toute mutation lève."""
+    event = build_event(config.rules, "home/salon/capteur", "p")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        event.topic = "autre"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        event.payload = "autre"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        event.rule.name = "autre"
+
+
+def test_event_rule_snapshotted_not_reread():
+    """AC-1.2.6 : la règle est figée à la sélection, jamais relue depuis la liste."""
+    rules = [Rule(name="a", topic="home/x"), Rule(name="b", topic="home/y")]
+    event = build_event(tuple(rules), "home/x", "p")
+    # La config "changerait" en mémoire de test : l'événement en cours
+    # de traversée garde la règle figée à la sélection.
+    rules[0] = Rule(name="zz", topic="zz")
+    rules.pop()
+    assert event.rule == Rule(name="a", topic="home/x")
+
+
+async def test_overlapping_filters_single_notification_per_message(fake_broker, monkeypatch, capsys):
+    """AC-1.2.2 / NFR-3 : filtres en chevauchement partiel -> une seule notification par message.
+
+    Le faux broker livre chaque message une fois par souscription correspondante :
+    si la couverture laissait 'home/+/capteur' et 'home/salon/+' tous deux abonnés
+    (réduction par contenance seule), le message 'home/salon/capteur' partirait
+    deux fois. La fusion disjointe en 'home/+/+' ne le livre qu'une fois.
+    """
+    episodes, clients = fake_broker
+    monkeypatch.setattr(mqtt_module, "RECONNECT_BACKOFF_INITIAL", 0.01)
+    overlap_config = Config(
+        broker_host="localhost",
+        broker_port=1883,
+        device_token="t",
+        rules=(
+            Rule(name="capteur", topic="home/+/capteur"),
+            Rule(name="salon", topic="home/salon/+"),
+        ),
+    )
+    drop = aiomqtt.MqttError("drop")
+    episodes.append(
+        Episode(
+            messages=[
+                FakeMessage(b"1", topic="home/salon/capteur"),  # couvert par les 2 règles
+                FakeMessage(b"2", topic="home/bureau/capteur"),  # couvert par la 1re règle
+                FakeMessage(b"3", topic="home/cave/temp"),  # couvert par la fusion, aucune règle
+            ],
+            drop=drop,
+        )
+    )
+    notifier = CountingNotifier()
+    stop = asyncio.Event()
+    task = asyncio.create_task(run_pipeline(overlap_config, notifier, stop))
+
+    seen = ""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        seen += capsys.readouterr().out
+        if notifier.calls == 2 and "no matching rule" in seen:
+            break
+        await asyncio.sleep(0.02)
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
+
+    assert clients[0].subscribed == [("home/+/+", 0)]
+    assert notifier.calls == 2
+    out = seen + capsys.readouterr().out
+    assert "2 règles correspondent" in out
+    assert out.count("mqtt message topic=") == 3
+    assert "message ignored topic=home/cave/temp no matching rule" in out
+    assert "message ignored topic=home/salon/capteur" not in out
 
 
 async def test_sigterm_stops_serve_cleanly(fake_broker, config, capsys):
@@ -155,7 +281,9 @@ def test_main_returns_zero_on_valid_config(fake_broker, monkeypatch, tmp_path, c
               host: localhost
               port: 1883
             device_token: token-abc
-            topic: home/salon/capteur
+            rules:
+              - name: salon
+                topic: home/salon/capteur
             """
         ),
         encoding="utf-8",
@@ -179,7 +307,7 @@ def test_main_returns_zero_on_valid_config(fake_broker, monkeypatch, tmp_path, c
     [
         "broker:\n  port: 1883\n",  # clé host manquante
         "ceci n'est pas : [du yaml\n",  # corrompu
-        "broker:\n  host: localhost\n  port: 1883\n",  # device_token/topic manquants
+        "broker:\n  host: localhost\n  port: 1883\n",  # device_token/rules manquants
     ],
 )
 def test_main_fails_fast_on_invalid_config(monkeypatch, tmp_path, capsys, yaml_content):
@@ -218,7 +346,9 @@ def test_sigterm_subprocess_exit_code_zero(tmp_path):
               host: 127.0.0.1
               port: {_free_port()}
             device_token: token-abc
-            topic: home/salon/capteur
+            rules:
+              - name: salon
+                topic: home/salon/capteur
             """
         ),
         encoding="utf-8",

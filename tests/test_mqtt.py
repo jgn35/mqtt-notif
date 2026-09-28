@@ -1,5 +1,6 @@
-"""AC-1.1.1 / AC-1.1.3 : connexion, souscription QoS 0, logs de cycle de vie,
-reconnexion automatique à backoff croissant, jamais d'arrêt spontané."""
+"""AC-1.1.1 / AC-1.1.3 / AC-1.2.2 : connexion, souscription QoS 0 à l'ensemble
+des topics des règles, logs de cycle de vie, reconnexion automatique à backoff
+croissant, jamais d'arrêt spontané."""
 
 from __future__ import annotations
 
@@ -10,9 +11,11 @@ import time
 import aiomqtt
 
 import mqtt_notif.mqtt as mqtt_module
+from mqtt_notif.config import Config
 from mqtt_notif.mqtt import RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX, iter_messages, message_payload
+from mqtt_notif.rules import Rule
 
-from .conftest import Episode, FakeMessage
+from .conftest import Episode, FakeClient, FakeMessage
 
 ISO_UTC = re.compile(r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?\+00:00\] ")
 
@@ -33,11 +36,78 @@ async def test_connect_subscribe_and_log(fake_broker, config, capsys):
         stop.set()
 
     assert got == ["hello"]
-    assert clients[0].subscribed == [(config.topic, 0)]
+    assert clients[0].subscribed == [(config.rules[0].topic, 0)]
     out = get_lines(capsys)
     assert ISO_UTC.match(out[0])
     assert f"mqtt connected {config.broker_host}:{config.broker_port}" in out[0]
-    assert f"topic={config.topic} qos=0" in out[0]
+    assert f"topics={config.rules[0].topic} qos=0" in out[0]
+
+
+async def test_multi_rule_subscriptions_and_resubscribe_on_reconnect(fake_broker, capsys):
+    """AC-1.2.2 : chaque connexion souscrit l'ensemble complet des topics, multi-règles.
+
+    Reconnexion après coupure : le nouveau client re-souscrit tout l'ensemble
+    (une règle oubliée serait une perte de couverture silencieuse).
+    """
+    episodes, clients = fake_broker
+    multi_config = Config(
+        broker_host="localhost",
+        broker_port=1883,
+        device_token="t",
+        rules=(
+            Rule(name="capteur", topic="home/salon/capteur"),
+            Rule(name="garage", topic="garage/#"),
+        ),
+    )
+    expected = [("garage/#", 0), ("home/salon/capteur", 0)]
+    drop = aiomqtt.MqttError("broker coupé")
+    episodes.append(Episode(messages=[FakeMessage(b"1", topic="garage/x")], drop=drop))
+    episodes.append(Episode(messages=[FakeMessage(b"2", topic="home/salon/capteur")], drop=drop))
+    stop = asyncio.Event()
+
+    got = []
+    async for message in iter_messages(multi_config, stop):
+        got.append(message_payload(message))
+        if len(got) == 2:
+            stop.set()
+
+    assert got == ["1", "2"]
+    assert clients[0].subscribed == expected
+    assert clients[1].subscribed == expected
+
+
+async def test_fake_broker_delivers_once_per_matching_subscription():
+    """Le faux broker modélise la livraison par souscription : filtres chevauchants -> 2 livraisons.
+
+    C'est l'état known-bad évité par la fusion disjointe : si le démon
+    s'abonnait à deux filtres s'intersectant, chaque message partirait deux fois.
+    """
+    episodes = [Episode(messages=[FakeMessage(b"x", topic="home/salon/capteur")])]
+    client = FakeClient(episodes)
+    async with client:
+        await client.subscribe("home/+/capteur", qos=0)
+        await client.subscribe("home/salon/+", qos=0)
+        deliveries = []
+        async for message in client.messages:
+            deliveries.append(message)
+            if len(deliveries) == 2:
+                break
+    assert len(deliveries) == 2
+
+
+async def test_fake_broker_single_delivery_for_disjoint_subscriptions():
+    """Souscriptions deux à deux disjointes : le même topic n'est livré qu'une fois."""
+    episodes = [Episode(messages=[FakeMessage(b"x", topic="home/salon/capteur")])]
+    client = FakeClient(episodes)
+    async with client:
+        await client.subscribe("home/+/+", qos=0)  # plus petit sur-ensemble fusionné
+        await client.subscribe("garage/#", qos=0)
+        deliveries = []
+        async for message in client.messages:
+            deliveries.append(message)
+            break
+    assert len(deliveries) == 1
+
 
 
 async def test_reconnect_after_drop(fake_broker, config, capsys):

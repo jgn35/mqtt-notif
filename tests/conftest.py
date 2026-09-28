@@ -8,6 +8,7 @@ import aiomqtt
 import pytest
 
 from mqtt_notif.config import Config
+from mqtt_notif.rules import Rule, topic_matches
 
 
 class FakeMessage:
@@ -35,7 +36,11 @@ class Episode:
 class FakeClient:
     """Remplace aiomqtt.Client : consomme une liste partagée d'épisodes.
 
-    Épisodes épuisés -> erreur de connexion (broker définitivement injoignable).
+    Fidèle à la sémantique broker : un message est livré une fois par
+    souscription correspondante (filtres '+'/'#' évalués par topic_matches) —
+    des souscriptions chevauchantes dupliquent donc la livraison, comme sur
+    un vrai broker. Épisodes épuisés -> erreur de connexion (broker
+    définitivement injoignable).
     """
 
     def __init__(self, episodes, hostname="", port=0):
@@ -59,7 +64,7 @@ class FakeClient:
         return False
 
     async def subscribe(self, topic, qos=0):
-        self.subscribed.append((topic, qos))
+        self.subscribed.append((str(topic), qos))
 
     @property
     def messages(self):
@@ -67,7 +72,12 @@ class FakeClient:
 
     async def _iter_messages(self):
         for message in self._episode.messages:
-            yield message
+            # Une livraison par souscription correspondante, dans l'ordre
+            # des souscriptions prises sur ce client.
+            topic = str(message.topic)
+            for filter_topic, _qos in self.subscribed:
+                if topic_matches(filter_topic, topic):
+                    yield message
         if self._episode.drop is not None:
             raise self._episode.drop
         # Connexion silencieuse : reste établie sans rien livrer.
@@ -98,5 +108,5 @@ def config() -> Config:
         broker_host="localhost",
         broker_port=1883,
         device_token="token-test-1234",
-        topic="home/salon/capteur",
+        rules=(Rule(name="capteur-salon", topic="home/salon/capteur"),),
     )
