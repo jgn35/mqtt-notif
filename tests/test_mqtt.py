@@ -56,8 +56,8 @@ async def test_multi_rule_subscriptions_and_resubscribe_on_reconnect(fake_broker
         broker_port=1883,
         device_token="t",
         rules=(
-            Rule(name="capteur", topic="home/salon/capteur"),
-            Rule(name="garage", topic="garage/#"),
+            Rule(name="capteur", topic="home/salon/capteur", title="titre", short_message="message"),
+            Rule(name="garage", topic="garage/#", title="titre", short_message="message"),
         ),
     )
     expected = [("garage/#", 0), ("home/salon/capteur", 0)]

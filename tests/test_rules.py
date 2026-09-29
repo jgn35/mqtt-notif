@@ -53,7 +53,7 @@ def test_topic_matches(pattern, topic, expected):
 
 def test_rule_is_frozen():
     """La règle est immuable : toute mutation lève (figée dans l'événement)."""
-    rule = Rule(name="salon", topic="home/#")
+    rule = Rule(name="salon", topic="home/#", title="titre", short_message="message")
     with pytest.raises(dataclasses.FrozenInstanceError):
         rule.name = "autre"
 
@@ -61,9 +61,9 @@ def test_rule_is_frozen():
 def test_find_rule_first_wins_and_counts():
     """AC-1.2.3 : première règle déclarée gagnante, toutes les correspondances comptées."""
     rules = (
-        Rule(name="a", topic="home/+/capteur"),
-        Rule(name="b", topic="home/salon/+"),
-        Rule(name="c", topic="home/#"),
+        Rule(name="a", topic="home/+/capteur", title="titre", short_message="message"),
+        Rule(name="b", topic="home/salon/+", title="titre", short_message="message"),
+        Rule(name="c", topic="home/#", title="titre", short_message="message"),
     )
     winner, matches = find_rule(rules, "home/salon/capteur")
     assert winner == rules[0]
@@ -71,34 +71,34 @@ def test_find_rule_first_wins_and_counts():
 
 
 def test_find_rule_single_match():
-    rules = (Rule(name="a", topic="home/+/capteur"), Rule(name="b", topic="garage/#"))
+    rules = (Rule(name="a", topic="home/+/capteur", title="titre", short_message="message"), Rule(name="b", topic="garage/#", title="titre", short_message="message"))
     winner, matches = find_rule(rules, "home/bureau/capteur")
     assert winner == rules[0]
     assert matches == 1
 
 
 def test_find_rule_no_match():
-    rules = (Rule(name="a", topic="home/+/capteur"), Rule(name="b", topic="garage/#"))
+    rules = (Rule(name="a", topic="home/+/capteur", title="titre", short_message="message"), Rule(name="b", topic="garage/#", title="titre", short_message="message"))
     winner, matches = find_rule(rules, "home/salon/temp")
     assert winner is None
     assert matches == 0
 
 
 def test_subscription_exact_duplicates_subscribed_once():
-    rules = (Rule(name="a", topic="home/x"), Rule(name="b", topic="home/x"))
+    rules = (Rule(name="a", topic="home/x", title="titre", short_message="message"), Rule(name="b", topic="home/x", title="titre", short_message="message"))
     assert subscription_topics(rules) == ("home/x",)
 
 
 def test_subscription_disjoint_filters_kept():
     rules = (
-        Rule(name="capteur", topic="home/salon/capteur"),
-        Rule(name="garage", topic="garage/#"),
+        Rule(name="capteur", topic="home/salon/capteur", title="titre", short_message="message"),
+        Rule(name="garage", topic="garage/#", title="titre", short_message="message"),
     )
     assert subscription_topics(rules) == ("garage/#", "home/salon/capteur")
 
 
 def test_subscription_containment_keeps_superset():
-    rules = (Rule(name="maison", topic="home/#"), Rule(name="salon", topic="home/salon/temp"))
+    rules = (Rule(name="maison", topic="home/#", title="titre", short_message="message"), Rule(name="salon", topic="home/salon/temp", title="titre", short_message="message"))
     assert subscription_topics(rules) == ("home/#",)
 
 
@@ -110,8 +110,8 @@ def test_subscription_partial_overlap_merged_to_least_upper_bound():
     petit sur-ensemble MQTT : 'home/+/+'.
     """
     rules = (
-        Rule(name="capteur", topic="home/+/capteur"),
-        Rule(name="salon", topic="home/salon/+"),
+        Rule(name="capteur", topic="home/+/capteur", title="titre", short_message="message"),
+        Rule(name="salon", topic="home/salon/+", title="titre", short_message="message"),
     )
     assert subscription_topics(rules) == ("home/+/+",)
 
@@ -119,33 +119,33 @@ def test_subscription_partial_overlap_merged_to_least_upper_bound():
 def test_subscription_merge_iterated_to_fixed_point():
     """La fusion est réitérée : le résultat de la fusion peut chevaucher un tiers."""
     rules = (
-        Rule(name="capteur", topic="home/+/capteur"),
-        Rule(name="salon", topic="home/salon/+"),
-        Rule(name="bureau", topic="home/bureau/capteur"),
+        Rule(name="capteur", topic="home/+/capteur", title="titre", short_message="message"),
+        Rule(name="salon", topic="home/salon/+", title="titre", short_message="message"),
+        Rule(name="bureau", topic="home/bureau/capteur", title="titre", short_message="message"),
     )
     assert subscription_topics(rules) == ("home/+/+",)
 
 
 def test_subscription_hash_exhaustion_merge():
     rules = (
-        Rule(name="salon", topic="home/salon/#"),
-        Rule(name="profonde", topic="home/salon/temp/x"),
+        Rule(name="salon", topic="home/salon/#", title="titre", short_message="message"),
+        Rule(name="profonde", topic="home/salon/temp/x", title="titre", short_message="message"),
     )
     assert subscription_topics(rules) == ("home/salon/#",)
 
 
 def test_subscription_two_hash_filters_merge_on_common_prefix():
-    rules = (Rule(name="a", topic="home/+/x/#"), Rule(name="b", topic="home/salon/#"))
+    rules = (Rule(name="a", topic="home/+/x/#", title="titre", short_message="message"), Rule(name="b", topic="home/salon/#", title="titre", short_message="message"))
     assert subscription_topics(rules) == ("home/+/#",)
 
 
 def test_subscriptions_cover_union_and_are_pairwise_disjoint():
     """Propriété : chaque topic de règle est couvert, aucun topic par deux souscriptions."""
     rules = (
-        Rule(name="a", topic="home/+/capteur"),
-        Rule(name="b", topic="home/salon/+"),
-        Rule(name="c", topic="garage/#"),
-        Rule(name="d", topic="home/#"),
+        Rule(name="a", topic="home/+/capteur", title="titre", short_message="message"),
+        Rule(name="b", topic="home/salon/+", title="titre", short_message="message"),
+        Rule(name="c", topic="garage/#", title="titre", short_message="message"),
+        Rule(name="d", topic="home/#", title="titre", short_message="message"),
     )
     topics = subscription_topics(rules)
     probes = [

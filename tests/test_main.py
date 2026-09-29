@@ -1,6 +1,6 @@
-"""AC-1.1.5 / AC-1.1.6 / AC-1.2.3 / AC-1.2.5 / AC-1.2.6 : assemblage,
-sélection première-gagnante, événement immuable, tâche d'envoi indépendante,
-SIGTERM -> exit 0."""
+"""AC-1.1.5 / AC-1.1.6 / AC-1.2.3 / AC-1.2.5 / AC-1.2.6 / AC-1.3.x : assemblage,
+sélection première-gagnante, payload parsé à la sélection, rendu des gabarits,
+tâche d'envoi indépendante, SIGTERM -> exit 0."""
 
 from __future__ import annotations
 
@@ -22,7 +22,8 @@ import mqtt_notif.main as main_module
 import mqtt_notif.mqtt as mqtt_module
 from mqtt_notif.config import Config
 from mqtt_notif.main import build_event, main, run_pipeline, serve
-from mqtt_notif.rules import Rule
+from mqtt_notif.render import MISSING, render_message
+from mqtt_notif.rules import PAYLOAD_FORMAT_RAW, Rule
 
 from .conftest import Episode, FakeMessage
 
@@ -39,7 +40,7 @@ class SlowNotifier:
         self.send_started = asyncio.Event()
         self.all_sent = asyncio.Event()
 
-    async def notify(self):
+    async def notify(self, event):
         self.started.append(time.monotonic())
         if len(self.started) >= 3:
             self.send_started.set()
@@ -50,13 +51,15 @@ class SlowNotifier:
 
 
 class CountingNotifier:
-    """Notifier compteur : une notification = un appel notify()."""
+    """Notifier compteur : une notification = un appel notify(event)."""
 
     def __init__(self):
         self.calls = 0
+        self.events = []
 
-    async def notify(self):
+    async def notify(self, event):
         self.calls += 1
+        self.events.append(event)
 
 
 async def test_slow_send_does_not_block_pipeline(fake_broker, config, monkeypatch):
@@ -64,8 +67,10 @@ async def test_slow_send_does_not_block_pipeline(fake_broker, config, monkeypatc
     episodes, _clients = fake_broker
     monkeypatch.setattr(mqtt_module, "RECONNECT_BACKOFF_INITIAL", 0.01)
     drop = aiomqtt.MqttError("drop")
-    episodes.append(Episode(messages=[FakeMessage(b"1")], drop=drop))
-    episodes.append(Episode(messages=[FakeMessage(b"2"), FakeMessage(b"3")], drop=drop))
+    episodes.append(Episode(messages=[FakeMessage(b'{"n": "1"}')], drop=drop))
+    episodes.append(
+        Episode(messages=[FakeMessage(b'{"n": "2"}'), FakeMessage(b'{"n": "3"}')], drop=drop)
+    )
     stop = asyncio.Event()
     notifier = SlowNotifier(delay=0.3)
 
@@ -91,12 +96,12 @@ async def test_slow_send_does_not_block_pipeline(fake_broker, config, monkeypatc
 def test_build_event_first_wins_with_multi_match_warning(capsys):
     """AC-1.2.3 / AC-1.2.5 : deux règles couvrent le message -> première traite, avertissement."""
     rules = (
-        Rule(name="capteur", topic="home/+/capteur"),
-        Rule(name="salon", topic="home/salon/+"),
+        Rule(name="capteur", topic="home/+/capteur", title="T1", short_message="M1"),
+        Rule(name="salon", topic="home/salon/+", title="T2", short_message="M2"),
     )
-    event = build_event(rules, "home/salon/capteur", "brut")
+    event = build_event(rules, "home/salon/capteur", '{"action": "x"}')
     assert event.topic == "home/salon/capteur"
-    assert event.payload == "brut"
+    assert event.payload == {"action": "x"}
     assert event.rule == rules[0]
     out = capsys.readouterr().out
     assert "warning" in out
@@ -105,39 +110,110 @@ def test_build_event_first_wins_with_multi_match_warning(capsys):
 
 
 def test_build_event_single_match_no_warning(capsys):
-    rules = (Rule(name="capteur", topic="home/+/capteur"), Rule(name="garage", topic="garage/#"))
-    event = build_event(rules, "home/bureau/capteur", "p")
+    rules = (
+        Rule(name="capteur", topic="home/+/capteur", title="T1", short_message="M1"),
+        Rule(name="garage", topic="garage/#", title="T2", short_message="M2"),
+    )
+    event = build_event(rules, "home/bureau/capteur", '{"a": "b"}')
     assert event.rule.name == "capteur"
+    assert event.payload == {"a": "b"}
     assert "warning" not in capsys.readouterr().out
 
 
 def test_build_event_no_match_returns_none(capsys):
     """Aucune correspondance : pas d'événement, pas d'avertissement multi-correspondances."""
-    event = build_event((Rule(name="salon", topic="home/salon/capteur"),), "home/cave/temp", "p")
+    event = build_event(
+        (Rule(name="salon", topic="home/salon/capteur", title="T", short_message="M"),),
+        "home/cave/temp",
+        '{"a": "b"}',
+    )
     assert event is None
     assert "warning" not in capsys.readouterr().out
 
 
 def test_event_is_frozen(config):
     """AC-1.2.6 : l'événement et sa règle sont immuables — toute mutation lève."""
-    event = build_event(config.rules, "home/salon/capteur", "p")
+    event = build_event(config.rules, "home/salon/capteur", '{"valeur": "1"}')
     with pytest.raises(dataclasses.FrozenInstanceError):
         event.topic = "autre"
     with pytest.raises(dataclasses.FrozenInstanceError):
-        event.payload = "autre"
+        event.payload = {"autre": "x"}
     with pytest.raises(dataclasses.FrozenInstanceError):
         event.rule.name = "autre"
 
 
 def test_event_rule_snapshotted_not_reread():
     """AC-1.2.6 : la règle est figée à la sélection, jamais relue depuis la liste."""
-    rules = [Rule(name="a", topic="home/x"), Rule(name="b", topic="home/y")]
-    event = build_event(tuple(rules), "home/x", "p")
+    rules = [
+        Rule(name="a", topic="home/x", title="T1", short_message="M1"),
+        Rule(name="b", topic="home/y", title="T2", short_message="M2"),
+    ]
+    event = build_event(tuple(rules), "home/x", '{"a": "1"}')
     # La config "changerait" en mémoire de test : l'événement en cours
     # de traversée garde la règle figée à la sélection.
-    rules[0] = Rule(name="zz", topic="zz")
+    rules[0] = Rule(name="zz", topic="zz", title="T", short_message="M")
     rules.pop()
-    assert event.rule == Rule(name="a", topic="home/x")
+    assert event.rule == Rule(name="a", topic="home/x", title="T1", short_message="M1")
+
+
+# --- Story 1.3 : payload parsé à la sélection, figé dans l'événement ---
+
+
+def test_build_event_parses_json_payload_at_selection():
+    """AC-1.3.4 : règle json -> payload parsé en dict, figé (pas de re-parsing)."""
+    event = build_event(
+        (Rule(name="c", topic="home/x", title="T", short_message="{a.b}"),),
+        "home/x",
+        '{"a": {"b": "valeur"}}',
+    )
+    assert event.payload == {"a": {"b": "valeur"}}
+
+
+def test_build_event_unparsable_json_payload_warns_and_renders_absent(capsys):
+    """AC-1.3.2 : payload json non parsable -> dict vide + avertissement, jamais ignoré."""
+    event = build_event(
+        (Rule(name="c", topic="home/x", title="T", short_message="Valeur: {a}"),),
+        "home/x",
+        "pas du tout du json",
+    )
+    out = capsys.readouterr().out
+    assert "payload json non parsable" in out
+    assert "topic=home/x" in out
+    assert "rule=c" in out
+    assert event.payload == {}
+    # Le rendu voit tous les champs absents : la notification part quand même.
+    assert render_message(event.rule, event.payload)["short_message"] == f"Valeur: {MISSING}"
+
+
+def test_build_event_non_dict_json_payload_warns_and_renders_absent(capsys):
+    """JSON parsable mais non-dict (liste, scalaire) : champs tous absents + avertissement."""
+    event = build_event(
+        (Rule(name="c", topic="home/x", title="T", short_message="{a}"),),
+        "home/x",
+        "[1, 2]",
+    )
+    assert "payload json non parsable" in capsys.readouterr().out
+    assert event.payload == {}
+
+
+def test_build_event_raw_payload_kept_as_string(capsys):
+    """AC-1.3.5 : règle raw -> payload brut figé tel quel, aucun parsing."""
+    event = build_event(
+        (
+            Rule(
+                name="c",
+                topic="home/x",
+                payload_format=PAYLOAD_FORMAT_RAW,
+                title="T",
+                short_message="{payload}",
+            ),
+        ),
+        "home/x",
+        "texte brut quelconque {pas du json}",
+    )
+    assert "warning" not in capsys.readouterr().out
+    assert event.payload == "texte brut quelconque {pas du json}"
+    assert render_message(event.rule, event.payload)["short_message"] == event.payload
 
 
 async def test_overlapping_filters_single_notification_per_message(fake_broker, monkeypatch, capsys):
@@ -155,17 +231,17 @@ async def test_overlapping_filters_single_notification_per_message(fake_broker, 
         broker_port=1883,
         device_token="t",
         rules=(
-            Rule(name="capteur", topic="home/+/capteur"),
-            Rule(name="salon", topic="home/salon/+"),
+            Rule(name="capteur", topic="home/+/capteur", title="T1", short_message="M1"),
+            Rule(name="salon", topic="home/salon/+", title="T2", short_message="M2"),
         ),
     )
     drop = aiomqtt.MqttError("drop")
     episodes.append(
         Episode(
             messages=[
-                FakeMessage(b"1", topic="home/salon/capteur"),  # couvert par les 2 règles
-                FakeMessage(b"2", topic="home/bureau/capteur"),  # couvert par la 1re règle
-                FakeMessage(b"3", topic="home/cave/temp"),  # couvert par la fusion, aucune règle
+                FakeMessage(b'{"n": "1"}', topic="home/salon/capteur"),  # couvert par les 2 règles
+                FakeMessage(b'{"n": "2"}', topic="home/bureau/capteur"),  # couvert par la 1re règle
+                FakeMessage(b'{"n": "3"}', topic="home/cave/temp"),  # couvert par la fusion, aucune règle
             ],
             drop=drop,
         )
@@ -205,13 +281,13 @@ async def test_hash_rule_end_to_end_notifies_every_message(fake_broker, monkeypa
         broker_host="localhost",
         broker_port=1883,
         device_token="t",
-        rules=(Rule(name="tout", topic="#"),),
+        rules=(Rule(name="tout", topic="#", title="Titre", short_message="Message"),),
     )
     episodes.append(
         Episode(
             messages=[
-                FakeMessage(b"1", topic="home/salon/capteur"),
-                FakeMessage(b"2", topic="garage/portail"),
+                FakeMessage(b'{"n": "1"}', topic="home/salon/capteur"),
+                FakeMessage(b'{"n": "2"}', topic="garage/portail"),
             ],
             drop=aiomqtt.MqttError("drop"),
         )
@@ -231,6 +307,70 @@ async def test_hash_rule_end_to_end_notifies_every_message(fake_broker, monkeypa
     out = capsys.readouterr().out
     assert "warning" not in out
     assert "no matching rule" not in out
+
+
+async def test_two_rules_distinct_templates_two_distinct_notifications(
+    fake_broker, monkeypatch, capsys
+):
+    """AC-1.3.3 (FR-4) : deux règles aux gabarits différents déclenchées ->
+    deux notifications au contenu distinct, fidèles aux gabarits."""
+    episodes, _clients = fake_broker
+    monkeypatch.setattr(mqtt_module, "RECONNECT_BACKOFF_INITIAL", 0.01)
+    two_rule_config = Config(
+        broker_host="localhost",
+        broker_port=1883,
+        device_token="t",
+        rules=(
+            Rule(
+                name="bouton",
+                topic="home/salon/bouton",
+                title="Bouton salon",
+                short_message="Bouton appuyé ({action})",
+                detailed_message="Pièce: {capteur.lieu}",
+            ),
+            Rule(
+                name="temperature",
+                topic="home/salon/temperature",
+                title="Température",
+                short_message="{capteur.lieu} : {valeur} degrés",
+            ),
+        ),
+    )
+    episodes.append(
+        Episode(
+            messages=[
+                FakeMessage(b'{"action": "simple"}', topic="home/salon/bouton"),
+                FakeMessage(
+                    b'{"capteur": {"lieu": "salon"}, "valeur": "21"}',
+                    topic="home/salon/temperature",
+                ),
+            ],
+            drop=aiomqtt.MqttError("drop"),
+        )
+    )
+    notifier = CountingNotifier()
+    stop = asyncio.Event()
+    task = asyncio.create_task(run_pipeline(two_rule_config, notifier, stop))
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and notifier.calls < 2:
+        await asyncio.sleep(0.02)
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
+
+    assert notifier.calls == 2
+    by_topic = {event.topic: render_message(event.rule, event.payload) for event in notifier.events}
+    assert by_topic == {
+        "home/salon/bouton": {
+            "title": "Bouton salon",
+            "short_message": "Bouton appuyé (simple)",
+            "detailed_message": f"Pièce: {MISSING}",
+        },
+        "home/salon/temperature": {
+            "title": "Température",
+            "short_message": "salon : 21 degrés",
+        },
+    }
 
 
 async def test_sigterm_stops_serve_cleanly(fake_broker, config, capsys):
@@ -257,7 +397,7 @@ async def test_pipeline_error_logged_and_restarted(config, monkeypatch, capsys):
         calls.append("call")
         if len(calls) == 1:
             raise ValueError("bug interne")
-        yield FakeMessage(b"x")
+        yield FakeMessage(b'{"n": "1"}')
         stop.set()
 
     monkeypatch.setattr(main_module, "iter_messages", flaky_iter_messages)
@@ -280,7 +420,7 @@ async def test_shutdown_drain_is_bounded(config, monkeypatch, capsys):
         def __init__(self):
             self.calls = 0
 
-        async def notify(self):
+        async def notify(self, event):
             self.calls += 1
             await asyncio.Event().wait()  # ne se termine jamais seul
 
@@ -288,7 +428,7 @@ async def test_shutdown_drain_is_bounded(config, monkeypatch, capsys):
     stop = asyncio.Event()
 
     async def one_message_iter(config, stop):
-        yield FakeMessage(b"1")
+        yield FakeMessage(b'{"n": "1"}')
         stop.set()
 
     monkeypatch.setattr(main_module, "iter_messages", one_message_iter)
@@ -318,6 +458,8 @@ def test_main_returns_zero_on_valid_config(fake_broker, monkeypatch, tmp_path, c
             rules:
               - name: salon
                 topic: home/salon/capteur
+                title: Capteur salon
+                short_message: 'Valeur: {valeur}'
             """
         ),
         encoding="utf-8",
@@ -325,7 +467,7 @@ def test_main_returns_zero_on_valid_config(fake_broker, monkeypatch, tmp_path, c
     monkeypatch.setenv("MQTT_NOTIF_CONFIG", str(config_path))
 
     async def fake_iter_messages(config, stop):
-        yield FakeMessage(b"event")
+        yield FakeMessage(b'{"valeur": "42"}')
         stop.set()
 
     monkeypatch.setattr("mqtt_notif.main.iter_messages", fake_iter_messages)
@@ -383,6 +525,8 @@ def test_sigterm_subprocess_exit_code_zero(tmp_path):
             rules:
               - name: salon
                 topic: home/salon/capteur
+                title: Capteur salon
+                short_message: 'Valeur: {{valeur}}'
             """
         ),
         encoding="utf-8",

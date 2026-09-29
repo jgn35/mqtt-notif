@@ -10,6 +10,7 @@ le démarrage, aucune erreur n'arrête le service (relance du pipeline journalis
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
 import sys
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from . import log_line
 from .config import Config, ConfigError, load_config_from_env
 from .mqtt import iter_messages, message_payload
 from .notifier import Notifier
-from .rules import Rule, find_rule
+from .rules import PAYLOAD_FORMAT_RAW, Rule, find_rule
 
 SHUTDOWN_TIMEOUT_S = 5.0
 RESTART_DELAY_S = 1.0
@@ -26,15 +27,39 @@ RESTART_DELAY_S = 1.0
 
 @dataclass(frozen=True)
 class Event:
-    """Événement immuable traversant le pipeline : règle figée à la sélection."""
+    """Événement immuable traversant le pipeline : règle figée à la sélection,
+    payload parsé à la sélection (dict pour une règle json, str pour une règle
+    raw) et jamais re-parsé en traversée."""
 
     topic: str
-    payload: str
+    payload: dict[str, object] | str
     rule: Rule
 
 
+def _parse_payload(raw: str, rule: Rule, topic: str) -> dict[str, object] | str:
+    """Parse le payload selon payload_format de la règle gagnante.
+
+    Règle json : dict attendu ; payload non parsable (ou non-dict) -> dict
+    vide + avertissement journalisé — le rendu voit tous les champs absents,
+    le message n'est jamais ignoré en bloc.
+    """
+    if rule.payload_format == PAYLOAD_FORMAT_RAW:
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = None
+    if not isinstance(parsed, dict):
+        log_line(
+            f"warning: payload json non parsable topic={topic} rule={rule.name}, "
+            "rendu comme si tous les champs étaient absents"
+        )
+        return {}
+    return parsed
+
+
 def build_event(rules: tuple[Rule, ...], topic: str, payload: str) -> Event | None:
-    """Étape de sélection : première règle gagnante, événement immuable.
+    """Étape de sélection : première règle gagnante, payload parsé, événement immuable.
 
     Aucune correspondance -> None (message ignoré par l'appelant) ;
     plusieurs correspondances -> avertissement journalisé, première retenue.
@@ -49,12 +74,14 @@ def build_event(rules: tuple[Rule, ...], topic: str, payload: str) -> Event | No
             f"warning: {matches} règles correspondent à topic={topic}, "
             f"première retenue rule={rule.name}"
         )
-    return Event(topic=topic, payload=payload, rule=rule)
+    return Event(topic=topic, payload=_parse_payload(payload, rule, topic), rule=rule)
 
 
 async def _dispatch(notifier: Notifier, event: Event) -> None:
-    """Étape émetteur : contenu encore fixe (le rendu depuis l'événement arrive en 1.3)."""
-    await notifier.notify()
+    """Étape émetteur : le rendu depuis l'événement puis l'envoi FCM s'exécutent
+    ici, dans cette tâche (hors boucle d'écoute) — aucune erreur de rendu ne
+    remonte au pipeline."""
+    await notifier.notify(event)
 
 
 async def run_pipeline(config: Config, notifier: Notifier, stop: asyncio.Event) -> None:

@@ -16,14 +16,21 @@ from dataclasses import dataclass
 
 LEVEL_PLUS = "+"
 LEVEL_HASH = "#"
+PAYLOAD_FORMAT_JSON = "json"
+PAYLOAD_FORMAT_RAW = "raw"
 
 
 @dataclass(frozen=True)
 class Rule:
-    """Règle de notification : nom unique et topic exact ou motif '+'/'#'."""
+    """Règle de notification : nom unique, topic exact ou motif '+'/'#',
+    gabarits de message et format du payload (json par défaut, raw)."""
 
     name: str
     topic: str
+    title: str
+    short_message: str
+    payload_format: str = PAYLOAD_FORMAT_JSON
+    detailed_message: str | None = None
 
 
 _REGEX_CACHE: dict[str, re.Pattern[str]] = {}

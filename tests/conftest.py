@@ -109,5 +109,12 @@ def config() -> Config:
         broker_host="localhost",
         broker_port=1883,
         device_token="token-test-1234",
-        rules=(Rule(name="capteur-salon", topic="home/salon/capteur"),),
+        rules=(
+            Rule(
+                name="capteur-salon",
+                topic="home/salon/capteur",
+                title="Capteur salon",
+                short_message="Valeur: {valeur}",
+            ),
+        ),
     )

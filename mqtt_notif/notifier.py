@@ -1,8 +1,11 @@
-"""Frontière FCM : envoi data-only à message fixe via asyncio.to_thread.
+"""Frontière FCM : envoi data-only construit depuis le rendu, via asyncio.to_thread.
 
-Seul module qui construit et envoie des messages FCM. Initialisation
-firebase-admin paresseuse depuis MQTT_NOTIF_FIREBASE_CREDENTIALS ; toute erreur
-d'envoi est journalisée sans retry et ne fait jamais planter le service.
+Seul module qui construit et envoie des messages FCM : notify(event) rend
+les gabarits de la règle figée dans l'événement (title, short_message,
+detailed_message seulement si la règle le définit) et envoie le message
+data-only. Initialisation firebase-admin paresseuse depuis
+MQTT_NOTIF_FIREBASE_CREDENTIALS ; toute erreur (rendu compris) est
+journalisée sans retry et ne fait jamais planter le service.
 """
 
 from __future__ import annotations
@@ -10,15 +13,18 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+from typing import TYPE_CHECKING
 
 import firebase_admin
 from firebase_admin import credentials, messaging
 
 from . import log_line
+from .render import render_message
+
+if TYPE_CHECKING:  # évite l'import circulaire main -> notifier -> main
+    from .main import Event
 
 CREDENTIALS_ENV = "MQTT_NOTIF_FIREBASE_CREDENTIALS"
-FIXED_TITLE = "mqtt-notif"
-FIXED_SHORT_MESSAGE = "Événement reçu"
 
 
 class Notifier:
@@ -29,15 +35,16 @@ class Notifier:
         self._app: firebase_admin.App | None = None
         self._init_lock = threading.Lock()
 
-    async def notify(self) -> None:
-        """Déclenche l'envoi du message FCM fixe dans un thread via to_thread.
+    async def notify(self, event: "Event") -> None:
+        """Rend le message depuis l'événement puis envoie le FCM via to_thread.
 
-        Ne lève jamais : toute erreur (identifiants absents, token refusé,
-        échec réseau) est journalisée, le service continue.
+        Ne lève jamais : toute erreur (rendu, identifiants absents, token
+        refusé, échec réseau) est journalisée, le service continue.
         """
         try:
-            await asyncio.to_thread(self._send)
-            log_line("fcm sent")
+            data = render_message(event.rule, event.payload)
+            await asyncio.to_thread(self._send, data)
+            log_line(f"fcm sent topic={event.topic}")
         except messaging.UnregisteredError:
             log_line(
                 "fcm send failed: device token absent ou refusé (unregistered), "
@@ -46,16 +53,13 @@ class Notifier:
         except Exception as exc:  # noqa: BLE001 — erreurs d'envoi jamais fatales
             log_line(f"fcm send failed error={type(exc).__name__}: {exc}")
 
-    def _send(self) -> None:
+    def _send(self, data: dict[str, str]) -> None:
         """Envoi bloquant firebase-admin ; s'exécute exclusivement via to_thread."""
         if not self._device_token.strip():
             raise ValueError("device token vide")
         app = self._get_app()
         message = messaging.Message(
-            data={
-                "title": FIXED_TITLE,
-                "short_message": FIXED_SHORT_MESSAGE,
-            },
+            data=data,
             token=self._device_token,
         )
         messaging.send(message, app=app)

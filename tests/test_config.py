@@ -1,5 +1,5 @@
-"""AC-1.2.1 : schéma `rules`, validation stricte citant la règle fautive,
-échec rapide au démarrage."""
+"""AC-1.2.1 / AC-1.3.5 / AC-1.3.7 : schéma `rules`, validation stricte citant
+la règle fautive (topics, gabarits, payload_format), échec rapide au démarrage."""
 
 from __future__ import annotations
 
@@ -20,8 +20,12 @@ VALID_YAML = textwrap.dedent(
     rules:
       - name: salon
         topic: home/salon/capteur
+        title: Capteur salon
+        short_message: 'Valeur: {valeur}'
       - name: maison
         topic: 'home/#'
+        title: Maison
+        short_message: '{event} détecté'
     """
 )
 
@@ -34,14 +38,18 @@ def write_yaml(tmp_path, content):
     return path
 
 
-def rule_yaml(topic, name="salon"):
-    r"""Section rules minimale avec une seule règle.
+def rule_yaml(topic, name="salon", extra=""):
+    r"""Section rules minimale avec une seule règle (gabarits valides par défaut).
 
     Le topic est écrit en style double-quoted : PyYAML y décode les escapes
     ("\x00", "\u200b") en caractères réels. Passer en style plain rendrait
     ces tests trivialement verts sans couvrir la validation Cc/Cf.
+    `extra` ajoute des lignes YAML supplémentaires (payload_format, gabarits).
     """
-    return f'rules:\n  - name: {name}\n    topic: "{topic}"\n'
+    return (
+        f'rules:\n  - name: {name}\n    topic: "{topic}"\n'
+        f'    title: "Titre {name}"\n    short_message: "Message {{champ}}"\n{extra}'
+    )
 
 
 def test_valid_yaml_loads(tmp_path):
@@ -50,8 +58,13 @@ def test_valid_yaml_loads(tmp_path):
     assert config.broker_port == 1883
     assert config.device_token == "abc123"
     assert config.rules == (
-        Rule(name="salon", topic="home/salon/capteur"),
-        Rule(name="maison", topic="home/#"),
+        Rule(
+            name="salon",
+            topic="home/salon/capteur",
+            title="Capteur salon",
+            short_message="Valeur: {valeur}",
+        ),
+        Rule(name="maison", topic="home/#", title="Maison", short_message="{event} détecté"),
     )
 
 
@@ -169,7 +182,11 @@ def test_legacy_topic_root_key_migration_hint(tmp_path):
 
 
 def test_duplicate_rule_names_rejected(tmp_path):
-    content = BROKER_YAML + rule_yaml("home/x", name="salon") + "  - name: salon\n    topic: home/y\n"
+    content = (
+        BROKER_YAML
+        + rule_yaml("home/x", name="salon")
+        + "  - name: salon\n    topic: home/y\n    title: T\n    short_message: M\n"
+    )
     with pytest.raises(ConfigError, match="dupliqué") as excinfo:
         load_config(str(write_yaml(tmp_path, content)))
     assert "salon" in str(excinfo.value)
@@ -208,12 +225,16 @@ def test_values_are_stripped(tmp_path):
         rules:
           - name: '  salon  '
             topic: '  home/salon  '
+            title: '  Titre  '
+            short_message: '  Message {champ}  '
         """
     )
     config = load_config(str(write_yaml(tmp_path, content)))
     assert config.broker_host == "localhost"
     assert config.device_token == "tok"
-    assert config.rules == (Rule(name="salon", topic="home/salon"),)
+    assert config.rules == (
+        Rule(name="salon", topic="home/salon", title="Titre", short_message="Message {champ}"),
+    )
 
 
 def test_corrupt_yaml(tmp_path):
@@ -260,3 +281,131 @@ def test_env_var_path_used(monkeypatch, tmp_path):
     assert config.broker_host == "localhost"
     assert config.rules[0].name == "salon"
     assert config_path_from_env() == str(path)
+
+
+# --- Story 1.3 : payload_format et gabarits par règle ---
+
+
+def test_rule_templates_and_default_payload_format(tmp_path):
+    """Sans payload_format : json par défaut ; gabarits portés par la règle."""
+    content = BROKER_YAML + rule_yaml("home/x", extra="    detailed_message: 'Détail {a.b}'\n")
+    config = load_config(str(write_yaml(tmp_path, content)))
+    rule = config.rules[0]
+    assert rule.payload_format == "json"
+    assert rule.title == "Titre salon"
+    assert rule.short_message == "Message {champ}"
+    assert rule.detailed_message == "Détail {a.b}"
+
+
+def test_rule_payload_format_raw_accepted(tmp_path):
+    """Mode raw : seul '{payload}' est autorisé dans les gabarits."""
+    content = BROKER_YAML + rule_yaml(
+        "home/x",
+        extra="    payload_format: raw\n    title: 'Alerte'\n    short_message: '{payload}'\n",
+    )
+    config = load_config(str(write_yaml(tmp_path, content)))
+    assert config.rules[0].payload_format == "raw"
+
+
+@pytest.mark.parametrize("payload_format", ["xml", "JSON", 3, None])
+def test_rule_payload_format_invalid_rejected(tmp_path, payload_format):
+    content = BROKER_YAML + rule_yaml(
+        "home/x", extra=f"    payload_format: {payload_format}\n"
+    )
+    with pytest.raises(ConfigError, match="'payload_format'") as excinfo:
+        load_config(str(write_yaml(tmp_path, content)))
+    assert "salon" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("field", ["title", "short_message"])
+def test_rule_missing_template_rejected(tmp_path, field):
+    """title et short_message sont obligatoires ; l'erreur cite règle et champ."""
+    fields = {"title": "    title: T\n", "short_message": "    short_message: M\n"}
+    del fields[field]
+    content = BROKER_YAML + "rules:\n  - name: salon\n    topic: home/x\n" + "".join(
+        fields.values()
+    )
+    with pytest.raises(ConfigError, match=f"'{field}'") as excinfo:
+        load_config(str(write_yaml(tmp_path, content)))
+    assert "salon" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("field", ["title", "short_message", "detailed_message"])
+def test_rule_empty_template_rejected(tmp_path, field):
+    content = BROKER_YAML + rule_yaml(
+        "home/x", extra=f"    detailed_message: d\n    {field}: ''\n"
+    )
+    with pytest.raises(ConfigError, match=f"'{field}'") as excinfo:
+        load_config(str(write_yaml(tmp_path, content)))
+    assert "salon" in str(excinfo.value)
+
+
+def test_rule_detailed_message_optional(tmp_path):
+    """Sans detailed_message : None, la clé n'existe pas dans la règle."""
+    content = BROKER_YAML + rule_yaml("home/x")
+    config = load_config(str(write_yaml(tmp_path, content)))
+    assert config.rules[0].detailed_message is None
+
+
+@pytest.mark.parametrize(
+    "field, template, expected",
+    [
+        ("title", "Alerte { champ}", "placeholder avec espace interdit"),
+        ("title", "Alerte {champ", "accolade non fermée"),
+        ("title", "Alerte {}", "placeholder vide"),
+        ("title", "Alerte {ch{amp}", "'{' interdit dans un placeholder"),
+        ("short_message", "Valeur {champ", "accolade non fermée"),
+        ("short_message", "Valeur { champ }", "placeholder avec espace interdit"),
+        ("detailed_message", "Détail {champ", "accolade non fermée"),
+    ],
+)
+def test_rule_malformed_template_rejected(tmp_path, field, template, expected):
+    """AC-1.3.1 : gabarit malformé -> démarrage refusé, règle et champ cités."""
+    content = BROKER_YAML + rule_yaml(
+        "home/x", extra=f"    detailed_message: d\n    {field}: '{template}'\n"
+    )
+    with pytest.raises(ConfigError, match=re.escape(expected)) as excinfo:
+        load_config(str(write_yaml(tmp_path, content)))
+    message = str(excinfo.value)
+    assert "salon" in message
+    assert f"'{field}'" in message
+    assert template in message
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["{payload}", "Alerte {payload}", "{{accolade}} {payload}", "{payload} !"],
+)
+def test_rule_raw_mode_only_payload_placeholder_allowed(tmp_path, template):
+    """Mode raw : '{payload}' seul est légal, y compris avec '{{' littéral."""
+    content = BROKER_YAML + rule_yaml(
+        "home/x",
+        extra=f"    payload_format: raw\n    short_message: '{template}'\n",
+    )
+    config = load_config(str(write_yaml(tmp_path, content)))
+    assert config.rules[0].short_message == template
+
+
+@pytest.mark.parametrize(
+    "template, field",
+    [
+        ("Valeur {champ}", "short_message"),
+        ("{capteur.lieu}", "title"),
+        ("{payload} et {autre}", "detailed_message"),
+    ],
+)
+def test_rule_raw_mode_other_placeholders_rejected(tmp_path, template, field):
+    """AC-1.3.5 : placeholder autre que '{payload}' en mode raw -> rejet au chargement."""
+    content = BROKER_YAML + rule_yaml(
+        "home/x",
+        extra=(
+            "    payload_format: raw\n"
+            "    short_message: '{payload}'\n"
+            f"    {field}: '{template}'\n"
+        ),
+    )
+    with pytest.raises(ConfigError, match="mode raw") as excinfo:
+        load_config(str(write_yaml(tmp_path, content)))
+    message = str(excinfo.value)
+    assert "salon" in message
+    assert f"'{field}'" in message

@@ -2,8 +2,10 @@
 
 Clés attendues : broker.host, broker.port, device_token, rules
 (liste ordonnée de règles : name non vide unique, topic exact ou motif
-'+'/'#' légal). Le chemin du fichier vient de MQTT_NOTIF_CONFIG
-(variable d'environnement).
+'+'/'#' légal, payload_format 'json' par défaut ou 'raw', gabarits
+title/short_message non vides, detailed_message optionnel — syntaxe des
+gabarits validée ici, jamais seulement au rendu). Le chemin du fichier
+vient de MQTT_NOTIF_CONFIG (variable d'environnement).
 """
 
 from __future__ import annotations
@@ -14,7 +16,14 @@ from dataclasses import dataclass
 
 import yaml
 
-from .rules import LEVEL_HASH, LEVEL_PLUS, Rule
+from .render import TemplateError, validate_template
+from .rules import (
+    LEVEL_HASH,
+    LEVEL_PLUS,
+    PAYLOAD_FORMAT_JSON,
+    PAYLOAD_FORMAT_RAW,
+    Rule,
+)
 
 
 class ConfigError(Exception):
@@ -66,6 +75,10 @@ def _validate_topic_pattern(topic: str, name: str) -> None:
             invalid("'+' doit occuper un niveau entier")
 
 
+RULE_KEYS = ("name", "topic", "payload_format", "title", "short_message", "detailed_message")
+TEMPLATE_FIELDS = ("title", "short_message", "detailed_message")
+
+
 def _validate_rule(entry: object, index: int) -> Rule:
     """Valide une entrée de la section rules ; l'erreur cite la règle fautive."""
     label = f"Règle #{index + 1}"
@@ -77,11 +90,11 @@ def _validate_rule(entry: object, index: int) -> Rule:
             f"{label} : clé 'name' manquante ou invalide (chaîne non vide attendue)"
         )
     name = name.strip()
-    unknown_keys = sorted(set(entry) - {"name", "topic"}, key=str)
+    unknown_keys = sorted(set(entry) - set(RULE_KEYS), key=str)
     if unknown_keys:
         raise ConfigError(
             f"Règle '{name}' : clé(s) inconnue(s) {unknown_keys} "
-            "(clés 'name' et 'topic' attendues)"
+            f"(clés {list(RULE_KEYS)} attendues)"
         )
     topic = entry.get("topic")
     if not isinstance(topic, str) or not topic.strip():
@@ -90,7 +103,43 @@ def _validate_rule(entry: object, index: int) -> Rule:
         )
     topic = topic.strip()
     _validate_topic_pattern(topic, name)
-    return Rule(name=name, topic=topic)
+
+    payload_format = entry.get("payload_format", PAYLOAD_FORMAT_JSON)
+    if payload_format not in (PAYLOAD_FORMAT_JSON, PAYLOAD_FORMAT_RAW):
+        raise ConfigError(
+            f"Règle '{name}' : clé 'payload_format' invalide '{payload_format}' "
+            f"('{PAYLOAD_FORMAT_JSON}' ou '{PAYLOAD_FORMAT_RAW}' attendu)"
+        )
+
+    templates: dict[str, str] = {}
+    for field in TEMPLATE_FIELDS:
+        template = entry.get(field)
+        if template is None:
+            if field == "detailed_message":
+                continue
+            raise ConfigError(
+                f"Règle '{name}' : clé '{field}' manquante (gabarit non vide attendu)"
+            )
+        if not isinstance(template, str) or not template.strip():
+            raise ConfigError(
+                f"Règle '{name}' : clé '{field}' manquante ou invalide "
+                "(gabarit non vide attendu)"
+            )
+        templates[field] = template.strip()
+    try:
+        for field, template in templates.items():
+            validate_template(template, payload_format, name, field)
+    except TemplateError as exc:
+        raise ConfigError(str(exc)) from exc
+
+    return Rule(
+        name=name,
+        topic=topic,
+        payload_format=payload_format,
+        title=templates["title"],
+        short_message=templates["short_message"],
+        detailed_message=templates.get("detailed_message"),
+    )
 
 
 def _validate_rules(raw_rules: object) -> tuple[Rule, ...]:
