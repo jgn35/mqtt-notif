@@ -2,7 +2,7 @@
 title: 'Story 2.2 — Debounce par règle'
 type: 'feature'
 created: '2026-09-28'
-status: 'in-progress'
+status: 'done'
 route: 'dispatch'
 review_loop_iteration: 0
 baseline_commit: 34706a9
@@ -62,10 +62,10 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `mqtt_notif/debounce.py` -- Debouncer : fenêtre par nom de règle ancrée à la réception, purge, horloge injectable -- AD-7, AC-2.2.1, AC-2.2.3, AC-2.2.5, AC-2.2.7.
-- [ ] `mqtt_notif/config.py` + `rules.py` -- `debounce_ms` par règle, validation des bornes [0, 3 600 000] -- AC-2.2.6.
-- [ ] `mqtt_notif/main.py` -- étape debounce entre rendu et émetteur, purge au swap, horodatage capturé à la réception -- AC-2.2.1, AC-2.2.2, AC-2.2.3, AC-2.2.7, AC-2.2.8.
-- [ ] `tests/` -- couvrir la matrice I/O et chaque AC automatisable -- chaque AC.
+- [x] `mqtt_notif/debounce.py` -- Debouncer : fenêtre par nom de règle ancrée à la réception, purge, horloge injectable -- AD-7, AC-2.2.1, AC-2.2.3, AC-2.2.5, AC-2.2.7.
+- [x] `mqtt_notif/config.py` + `rules.py` -- `debounce_ms` par règle, validation des bornes [0, 3 600 000] -- AC-2.2.6.
+- [x] `mqtt_notif/main.py` -- étape debounce entre rendu et émetteur, purge au swap, horodatage capturé à la réception -- AC-2.2.1, AC-2.2.2, AC-2.2.3, AC-2.2.7, AC-2.2.8.
+- [x] `tests/` -- couvrir la matrice I/O et chaque AC automatisable -- chaque AC.
 
 **Acceptance Criteria:**
 - Given une règle `debounce_ms: 1000` et un premier message notifié, when un second arrive 400 ms plus tard, then aucune notification et le message ignoré est journalisé.
@@ -80,7 +80,24 @@ Décisions internes (non perceptibles pour l'utilisateur) :
 - Le Debouncer vit dans la boucle asyncio unique : un simple dict nom → horodatage de réception ; toute mutation se fait dans la tâche de dispatch (mono-boucle, pas de verrou) ; la purge au swap est appelée par la source ou le pipeline au moment du `changed` — jamais de thread.
 - Fenêtre ouverte = horodatage de réception du dernier message notifié ; un message reçu pendant `notified_at + debounce_ms` est ignoré (aucun repositionnement de fenêtre sur un message ignoré — la fenêtre n'est prolongée que par une notification).
 - L'horloge (`time.monotonic`) est injectable pour des tests déterministes ; la réception est capturée avant l'étape debounce (jamais après le rendu ni l'envoi).
-- Position exacte dans le pipeline : l'événement est rendu (rendu jamais silencié), puis le debounce décide si l'émetteur est appelé — AD-1 ordonne rendu → debounce → émetteur.
+- Position exacte dans le pipeline : la porte de debounce s'exécute dans la tâche de dispatch avant l'appel de l'émetteur — le rendu (dans notifier.notify) n'est exécuté que pour les messages qui passent la porte ; l'isolation AD-1 est préservée, l'ordre physique rendu/debounce s'écarte de l'ordre logique sans effet comportemental (consigné au Review Triage Log).
+- La fenêtre s'ouvre sur la décision (message reçu hors fenêtre), jamais sur le résultat de l'envoi : un échec FCM ne referme pas la fenêtre (AD-7 « pas à l'envoi », test pinant ce comportement).
+- Aucun timer ni sommeil : la fenêtre est une comparaison à l'arrivée du message (écart à la mention « asyncio.sleep » de la spec, AD-2 respecté — aucun thread).
+
+## Review Triage Log
+
+- `debounce.py/main.py` — un envoi FCM qui échoue laisse la fenêtre ouverte (messages suivants silenciés sans notification livrée) — false comme défaut — conforme à AD-7 « fenêtre ouverte à la réception (pas à l'envoi) » : la fenêtre ne dépend jamais du résultat de l'envoi — patch (test pinant l'interaction + docstring explicite).
+- `main.py` docstrings — « journalisé en debug » alors que log_line n'a pas de niveaux — low — réel (doc) — patch (marqueur `debug:` sur la ligne, alignement des docstrings).
+- `main.py/_dispatch` — le debounce précède physiquement le rendu (rendu dans notifier.notify), pas « entre rendu et émetteur » — low — réel (écart à l'ordre logique AD-1) ; isolation des étapes préservée, comportement équivalent, messages silenciés jamais rendus — patch (docstrings + test renommés ; écart consigné ici).
+- `main.py` — le log de message silencié n'indique pas le temps restant dans la fenêtre — low — réel — patch (millisecondes restantes dans la ligne).
+- `mqtt.py:iter_messages` — paramètre debouncer optionnel (None = purge silencieusement ignorée) — low — réel (footgun) — patch (paramètre requis).
+- `debounce.py:purge` — une règle redéfinie sous le même nom garde sa fenêtre — false — AD-7 : « persistance de celles conservées » (conservation par nom) — patch (docstring + test pinant la redéfinition).
+- `tests/test_debounce.py` — résultats de `until()` jamais affirmés (timeout dégradé en échec distant) ; helpers `bump_mtime`/`write_yaml` dupliqués depuis test_hot_reload.py ; asserts temps réel fragiles (0.15 s) — medium — réel — patch (assert, conftest, alignement).
+- `tests/` — chemin horloge réelle jamais exercé avec expiration (tout via FakeClock) — low — réel — patch (un test 20 ms + court sommeil réel).
+- `tests/` — précédence des erreurs de validation combinées (debounce_ms + gabarit) non pinnée — low — réel — patch (test).
+- `debounce.py` — comparaison de frontière flottante (fenêtre semi-ouverte) — low — négligeable en usage réel (jitter de réception >> erreur flottante) — rejet avec note docstring.
+- `debounce.py` — horodatage antidaté / NaN (horloge injectée) — false en production — time.monotonic monotone et finie — rejet.
+- Écart consigné : la spec figée mentionnait « timer via asyncio.sleep » ; l'implémentation compare à l'arrivée du message, sans sommeil — AD-2 (aucun thread) respecté, mécanisme plus simple ; écart noté dans les Implementation Notes.
 
 ## Verification
 
