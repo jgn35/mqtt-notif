@@ -23,7 +23,8 @@ PAYLOAD_FORMAT_RAW = "raw"
 @dataclass(frozen=True)
 class Rule:
     """Règle de notification : nom unique, topic exact ou motif '+'/'#',
-    gabarits de message et format du payload (json par défaut, raw)."""
+    gabarits de message, format du payload (json par défaut, raw) et délai
+    de debounce optionnel en millisecondes (0 = pas de debounce, défaut)."""
 
     name: str
     topic: str
@@ -31,6 +32,7 @@ class Rule:
     short_message: str
     payload_format: str = PAYLOAD_FORMAT_JSON
     detailed_message: str | None = None
+    debounce_ms: int = 0
 
 
 _REGEX_CACHE: dict[str, re.Pattern[str]] = {}

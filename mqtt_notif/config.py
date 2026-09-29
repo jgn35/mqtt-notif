@@ -4,8 +4,9 @@ Clés attendues : broker.host, broker.port, device_token, rules
 (liste ordonnée de règles : name non vide unique, topic exact ou motif
 '+'/'#' légal, payload_format 'json' par défaut ou 'raw', gabarits
 title/short_message non vides, detailed_message optionnel — syntaxe des
-gabarits validée ici, jamais seulement au rendu). Le chemin du fichier
-vient de MQTT_NOTIF_CONFIG (variable d'environnement).
+gabarits validée ici, jamais seulement au rendu ; debounce_ms optionnel,
+entier borné [0, 3 600 000], 0 par défaut = pas de debounce). Le chemin du
+fichier vient de MQTT_NOTIF_CONFIG (variable d'environnement).
 
 Le ConfigStore est l'unique lecteur du fichier YAML : il détient la
 configuration courante, la recharge à chaud par sondage mtime (tâche
@@ -91,7 +92,20 @@ def _validate_topic_pattern(topic: str, name: str) -> None:
             invalid("'+' doit occuper un niveau entier")
 
 
-RULE_KEYS = ("name", "topic", "payload_format", "title", "short_message", "detailed_message")
+# Bornes de debounce_ms par règle (millisecondes) : 0 = pas de debounce,
+# une heure maximum — au-delà, une fenêtre oubliée ne se referait jamais.
+DEBOUNCE_MS_MIN = 0
+DEBOUNCE_MS_MAX = 3_600_000
+
+RULE_KEYS = (
+    "name",
+    "topic",
+    "payload_format",
+    "title",
+    "short_message",
+    "detailed_message",
+    "debounce_ms",
+)
 TEMPLATE_FIELDS = ("title", "short_message", "detailed_message")
 
 
@@ -127,6 +141,17 @@ def _validate_rule(entry: object, index: int) -> Rule:
             f"('{PAYLOAD_FORMAT_JSON}' ou '{PAYLOAD_FORMAT_RAW}' attendu)"
         )
 
+    debounce_ms = entry.get("debounce_ms", DEBOUNCE_MS_MIN)
+    if (
+        not isinstance(debounce_ms, int)
+        or isinstance(debounce_ms, bool)
+        or not (DEBOUNCE_MS_MIN <= debounce_ms <= DEBOUNCE_MS_MAX)
+    ):
+        raise ConfigError(
+            f"Règle '{name}' : clé 'debounce_ms' invalide '{debounce_ms}' "
+            f"(entier {DEBOUNCE_MS_MIN}-{DEBOUNCE_MS_MAX} attendu)"
+        )
+
     templates: dict[str, str] = {}
     for field in TEMPLATE_FIELDS:
         template = entry.get(field)
@@ -155,6 +180,7 @@ def _validate_rule(entry: object, index: int) -> Rule:
         title=templates["title"],
         short_message=templates["short_message"],
         detailed_message=templates.get("detailed_message"),
+        debounce_ms=debounce_ms,
     )
 
 

@@ -5,8 +5,10 @@ reconnexion à backoff croissant.
 Les souscriptions sont pilotées par la configuration courante du
 ConfigStore : au rechargement, la source abonne les nouveaux topics et
 désabonne les disparus (aiomqtt subscribe/unsubscribe) sans jamais
-déconnecter le broker. Itération asynchrone des messages ; une ligne de
-journal (ISO 8601 UTC, stdout) par connexion, déconnexion, reconnexion
+déconnecter le broker. Au même moment (`changed`), elle purge les fenêtres
+de debounce des règles disparues (le debouncer, propriété du pipeline, lui
+est passé pour ce seul appel). Itération asynchrone des messages ; une ligne
+de journal (ISO 8601 UTC, stdout) par connexion, déconnexion, reconnexion
 et resynchronisation. Aucune erreur après le démarrage ne peut arrêter
 le service : la boucle de reconnexion est inconditionnelle.
 """
@@ -20,6 +22,7 @@ import aiomqtt
 
 from . import log_line
 from .config import ConfigStore
+from .debounce import Debouncer
 from .rules import subscription_topics
 
 RECONNECT_BACKOFF_INITIAL = 1.0
@@ -54,7 +57,7 @@ async def _resync_subscriptions(
 
 
 async def iter_messages(
-    store: ConfigStore, stop: asyncio.Event
+    store: ConfigStore, stop: asyncio.Event, debouncer: Debouncer | None = None
 ) -> AsyncIterator[aiomqtt.Message]:
     """Itère les messages des topics souscrits ; reconnexion auto à backoff croissant.
 
@@ -65,10 +68,12 @@ async def iter_messages(
     de configuration (événement `changed` du store), l'attente du prochain
     message est interrompue par course (FIRST_COMPLETED) pour appliquer le
     delta abonnement/désabonnement sans déconnexion — un message sur un
-    topic retiré ne déclenche plus rien. Retourne uniquement quand `stop`
-    est déclenché (arrêt propre SIGTERM/SIGINT). Une erreur broker après
-    le premier démarrage ne termine jamais l'itération : déconnexion
-    journalisée, attente exponentielle bornée, puis reconnexion.
+    topic retiré ne déclenche plus rien — et purger les fenêtres de
+    debounce des règles disparues (celles des règles conservées restent).
+    Retourne uniquement quand `stop` est déclenché (arrêt propre
+    SIGTERM/SIGINT). Une erreur broker après le premier démarrage ne
+    termine jamais l'itération : déconnexion journalisée, attente
+    exponentielle bornée, puis reconnexion.
     """
     backoff = RECONNECT_BACKOFF_INITIAL
     ever_connected = False
@@ -98,9 +103,14 @@ async def iter_messages(
                         if store.changed.is_set():
                             # Swap de configuration : delta abonner/désabonner
                             # sans déconnexion, le message en attente n'est
-                            # jamais annulé ni perdu.
+                            # jamais annulé ni perdu. Purge des fenêtres de
+                            # debounce des règles disparues (conservation de
+                            # celles des règles restées) au moment du changed.
                             store.changed.clear()
-                            topics = subscription_topics(store.get().rules)
+                            rules = store.get().rules
+                            if debouncer is not None:
+                                debouncer.purge({rule.name for rule in rules})
+                            topics = subscription_topics(rules)
                             await _resync_subscriptions(client, current, topics)
                             current = set(topics)
                             continue

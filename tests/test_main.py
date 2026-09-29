@@ -502,7 +502,7 @@ async def test_pipeline_error_logged_and_restarted(config, monkeypatch, capsys):
     monkeypatch.setattr(main_module, "RESTART_DELAY_S", 0)
     calls = []
 
-    async def flaky_iter_messages(config, stop):
+    async def flaky_iter_messages(config, stop, debouncer=None):
         calls.append("call")
         if len(calls) == 1:
             raise ValueError("bug interne")
@@ -536,7 +536,7 @@ async def test_shutdown_drain_is_bounded(config, monkeypatch, capsys):
     notifier = StuckNotifier()
     stop = asyncio.Event()
 
-    async def one_message_iter(config, stop):
+    async def one_message_iter(config, stop, debouncer=None):
         yield FakeMessage(b'{"n": "1"}')
         stop.set()
 
@@ -618,7 +618,7 @@ def test_main_returns_zero_on_valid_config(fake_broker, monkeypatch, tmp_path, c
     )
     monkeypatch.setenv("MQTT_NOTIF_CONFIG", str(config_path))
 
-    async def fake_iter_messages(config, stop):
+    async def fake_iter_messages(config, stop, debouncer=None):
         yield FakeMessage(b'{"valeur": "42"}')
         stop.set()
 

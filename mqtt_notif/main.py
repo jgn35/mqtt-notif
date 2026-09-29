@@ -1,10 +1,13 @@
-"""Assemblage du pipeline : source MQTT -> sélection de règle -> envoi FCM,
-boucle asyncio unique.
+"""Assemblage du pipeline : source MQTT -> sélection de règle -> debounce ->
+envoi FCM, boucle asyncio unique.
 
 La sélection lit le snapshot du ConfigStore à chaque message (règle figée
 dans l'événement, jamais relue) ; le store et sa tâche de surveillance du
 YAML (sondage mtime, rechargement à chaud) sont créés à l'assemblage et
-le watcher est arrêté proprement au SIGTERM/SIGINT.
+le watcher est arrêté proprement au SIGTERM/SIGINT. Le debounce optionnel
+par règle (fenêtre ancrée à la réception du message, jamais à l'envoi)
+s'insère entre le rendu et l'émetteur : l'émetteur n'est appelé que si la
+fenêtre l'autorise, le message ignoré est journalisé en debug.
 
 Tâche d'envoi asyncio indépendante par message (la boucle n'attend jamais la
 fin d'un envoi). SIGTERM/SIGINT -> arrêt propre, exit code 0. Erreurs fatales
@@ -22,6 +25,7 @@ from dataclasses import dataclass
 
 from . import log_line
 from .config import ConfigError, ConfigStore, load_store_from_env
+from .debounce import Debouncer
 from .mqtt import iter_messages, message_payload
 from .notifier import Notifier
 from .rules import PAYLOAD_FORMAT_RAW, Rule, find_rule
@@ -88,32 +92,55 @@ def build_event(rules: tuple[Rule, ...], topic: str, payload: str) -> Event | No
     return Event(topic=topic, payload=_parse_payload(payload, rule, topic), rule=rule)
 
 
-async def _dispatch(notifier: Notifier, event: Event) -> None:
-    """Étape émetteur : le rendu depuis l'événement puis l'envoi FCM s'exécutent
-    ici, dans cette tâche (hors boucle d'écoute) — aucune erreur de rendu ne
-    remonte au pipeline."""
+async def _dispatch(
+    notifier: Notifier, debouncer: Debouncer, event: Event, received_at: float
+) -> None:
+    """Étape émetteur : le debounce décide si l'émetteur est appelé (fenêtre
+    ancrée à la réception du message, jamais à l'envoi) ; le rendu et l'envoi
+    FCM s'exécutent ici, dans cette tâche (hors boucle d'écoute) — aucune
+    erreur de rendu ne remonte au pipeline. Un message silencié est perdu
+    (QoS 0, aucun rejeu) et journalisé en debug."""
+    if not debouncer.should_notify(event.rule, received_at):
+        log_line(
+            f"message ignored topic={event.topic} rule={event.rule.name} "
+            f"debounce_ms={event.rule.debounce_ms} (fenêtre active)"
+        )
+        return
     await notifier.notify(event)
 
 
-async def run_pipeline(store: ConfigStore, notifier: Notifier, stop: asyncio.Event) -> None:
+async def run_pipeline(
+    store: ConfigStore,
+    notifier: Notifier,
+    stop: asyncio.Event,
+    debouncer: Debouncer | None = None,
+) -> None:
     """Consomme la source MQTT et déclenche un envoi FCM par message, sans l'attendre.
 
     La sélection lit `store.get()` à chaque message : la règle gagnante est
     figée dans l'événement (jamais relue en traversée), un rechargement de
-    configuration prend effet à l'événement suivant. Retourne quand `stop`
-    est observé ; laisse finir les envois en cours, borné dans le temps —
-    au-delà, les envois restants sont annulés et journalisés.
+    configuration prend effet à l'événement suivant. L'horodatage de
+    réception est capturé à la lecture du message, avant toute étape aval —
+    jamais à l'envoi : un envoi FCM lent n'étend pas la fenêtre de debounce.
+    Le debouncer (état en mémoire, propriété du pipeline, horloge injectable
+    pour les tests) est purgé au swap de configuration par la source (règles
+    conservées). Retourne quand `stop` est observé ; laisse finir les envois
+    en cours, borné dans le temps — au-delà, les envois restants sont
+    annulés et journalisés.
     """
+    if debouncer is None:
+        debouncer = Debouncer()
     pending: set[asyncio.Task[None]] = set()
     try:
-        async for message in iter_messages(store, stop):
+        async for message in iter_messages(store, stop, debouncer):
+            received_at = debouncer.now()
             topic = str(message.topic)
             log_line(f"mqtt message topic={topic}")
             event = build_event(store.get().rules, topic, message_payload(message))
             if event is None:
                 log_line(f"message ignored topic={topic} no matching rule")
                 continue
-            task = asyncio.create_task(_dispatch(notifier, event))
+            task = asyncio.create_task(_dispatch(notifier, debouncer, event, received_at))
             pending.add(task)
             task.add_done_callback(pending.discard)
     finally:

@@ -1,5 +1,6 @@
-"""AC-1.2.1 / AC-1.3.5 / AC-1.3.7 : schéma `rules`, validation stricte citant
-la règle fautive (topics, gabarits, payload_format), échec rapide au démarrage."""
+"""AC-1.2.1 / AC-1.3.5 / AC-1.3.7 / AC-2.2.6 : schéma `rules`, validation stricte
+citant la règle fautive (topics, gabarits, payload_format, debounce_ms),
+échec rapide au démarrage."""
 
 from __future__ import annotations
 
@@ -434,3 +435,52 @@ def test_rule_raw_mode_other_placeholders_rejected(tmp_path, template, field):
     message = str(excinfo.value)
     assert "salon" in message
     assert f"'{field}'" in message
+
+
+# --- Story 2.2 : debounce_ms par règle, bornes [0, 3 600 000] ---
+
+
+def test_rule_debounce_ms_defaults_to_zero(tmp_path):
+    """AC-2.2.6 : sans debounce_ms, la règle vaut 0 (pas de debounce)."""
+    content = BROKER_YAML + rule_yaml("home/x")
+    config = load_config(str(write_yaml(tmp_path, content)))
+    assert config.rules[0].debounce_ms == 0
+
+
+@pytest.mark.parametrize("debounce_ms", [0, 1, 1500, 3_600_000])
+def test_rule_debounce_ms_within_bounds_accepted(tmp_path, debounce_ms):
+    """AC-2.2.6 : bornes incluses [0, 3 600 000] acceptées, valeur portée par la règle."""
+    content = BROKER_YAML + rule_yaml("home/x", extra=f"    debounce_ms: {debounce_ms}\n")
+    config = load_config(str(write_yaml(tmp_path, content)))
+    assert config.rules[0].debounce_ms == debounce_ms
+
+
+@pytest.mark.parametrize(
+    "debounce_ms",
+    [-1, -100000, 3_600_001, 7_200_000],
+    ids=["negatif", "tres-negatif", "un-de-trop", "une-heure-et-plus"],
+)
+def test_rule_debounce_ms_out_of_bounds_rejected(tmp_path, debounce_ms):
+    """AC-2.2.6 : hors bornes -> rejet au chargement, erreur citant la règle."""
+    content = BROKER_YAML + rule_yaml("home/x", extra=f"    debounce_ms: {debounce_ms}\n")
+    with pytest.raises(ConfigError, match="'debounce_ms'") as excinfo:
+        load_config(str(write_yaml(tmp_path, content)))
+    message = str(excinfo.value)
+    assert "salon" in message
+    assert "0-3600000" in message
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["'1500'", "true", "1.5", "null", "[]", "{}"],
+    ids=["chaine", "booleen", "flottant", "null", "liste", "mapping"],
+)
+def test_rule_debounce_ms_non_integer_rejected(tmp_path, value):
+    """AC-2.2.6 : seul un entier passe — chaîne, booléen, flottant, null,
+    liste ou mapping sont rejetés avec la règle fautive citée."""
+    content = BROKER_YAML + rule_yaml("home/x", extra=f"    debounce_ms: {value}\n")
+    with pytest.raises(ConfigError, match="'debounce_ms'") as excinfo:
+        load_config(str(write_yaml(tmp_path, content)))
+    message = str(excinfo.value)
+    assert "salon" in message
+    assert "0-3600000" in message
