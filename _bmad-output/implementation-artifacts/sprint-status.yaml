@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-28-2026 15:44
-last_updated: 09-28-2026 19:10
+last_updated: 09-28-2026 20:05
 project: mqtt-notif
 project_key: NOKEY
 tracking_system: file-system
@@ -39,11 +39,11 @@ development_status:
   1-1-tranche-fine-du-message-mqtt-à-la-notification-fcm: review
   1-2-règles-yaml-et-sélection-première-gagnante: review
   1-3-rendu-des-gabarits-personnalisés: review
-  1-4-contrat-fcm-et-robustesse-de-l-émetteur: in-progress
+  1-4-contrat-fcm-et-robustesse-de-l-émetteur: review
   epic-1-retrospective: optional
 
-  epic-2: backlog
-  2-1-rechargement-à-chaud-avec-swap-atomique: backlog
+  epic-2: in-progress
+  2-1-rechargement-à-chaud-avec-swap-atomique: in-progress
   2-2-debounce-par-règle: backlog
   epic-2-retrospective: optional
 

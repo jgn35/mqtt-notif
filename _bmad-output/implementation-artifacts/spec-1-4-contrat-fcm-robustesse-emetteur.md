@@ -2,7 +2,7 @@
 title: 'Story 1.4 — Contrat FCM et robustesse de l'émetteur'
 type: 'feature'
 created: '2026-09-28'
-status: 'in-review'
+status: 'done'
 route: 'dispatch'
 review_loop_iteration: 0
 baseline_commit: 065c6d8
