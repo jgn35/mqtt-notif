@@ -8,7 +8,7 @@ import textwrap
 
 import pytest
 
-from mqtt_notif.config import ConfigError, config_path_from_env, load_config, load_config_from_env
+from mqtt_notif.config import ConfigError, config_path_from_env, load_config, load_store_from_env
 from mqtt_notif.rules import Rule
 
 VALID_YAML = textwrap.dedent(
@@ -284,13 +284,13 @@ def test_missing_or_invalid_keys(tmp_path, content, expected):
 def test_env_var_absent(monkeypatch):
     monkeypatch.delenv("MQTT_NOTIF_CONFIG", raising=False)
     with pytest.raises(ConfigError, match="MQTT_NOTIF_CONFIG"):
-        load_config_from_env()
+        load_store_from_env()
 
 
 def test_env_var_path_used(monkeypatch, tmp_path):
     path = write_yaml(tmp_path, VALID_YAML)
     monkeypatch.setenv("MQTT_NOTIF_CONFIG", str(path))
-    config = load_config_from_env()
+    config = load_store_from_env().get()
     assert config.broker_host == "localhost"
     assert config.rules[0].name == "salon"
     assert config_path_from_env() == str(path)

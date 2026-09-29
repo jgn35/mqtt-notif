@@ -149,6 +149,14 @@ async def serve(store: ConfigStore, notifier: Notifier) -> None:
         loop.add_signal_handler(sig, stop.set)
     stopper = asyncio.create_task(stop.wait())
     watcher = asyncio.create_task(store.watch(stop))
+
+    def _log_dead_watcher(task: asyncio.Task) -> None:
+        """Un watcher mort en service (bug interne, pas un mauvais fichier)
+        laisse une trace explicite : le rechargement à chaud est inopérant."""
+        if not task.cancelled() and task.exception() is not None:
+            log_line(f"config watcher error: {task.exception()!r}")
+
+    watcher.add_done_callback(_log_dead_watcher)
     try:
         while not stop.is_set():
             pipeline = asyncio.create_task(run_pipeline(store, notifier, stop))

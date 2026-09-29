@@ -231,6 +231,13 @@ def load_config(path: str) -> Config:
     )
 
 
+def _stat(path: str) -> tuple[int, int]:
+    """Signature de sondage : (mtime_ns, taille). La taille couvre les
+    réécritures à mtime identique (granularité du système de fichiers)."""
+    stat = os.stat(path)
+    return stat.st_mtime_ns, stat.st_size
+
+
 class ConfigStore:
     """Unique lecteur du YAML : détient la configuration courante et la
     recharge à chaud par sondage mtime.
@@ -249,9 +256,18 @@ class ConfigStore:
     def __init__(self, config: Config, path: str | None = None) -> None:
         self._config = config
         self._path = path
-        self._mtime_ns: int | None = (
-            os.stat(path).st_mtime_ns if path is not None else None
-        )
+        self._signature: tuple[int, int] | None = None
+        self._absent_logged = False
+        if path is not None:
+            # Un fichier qui disparaît entre le chargement initial et la
+            # construction du store : ConfigError explicite (échec rapide
+            # au démarrage), jamais d'OSError brut hors de main().
+            try:
+                self._signature = _stat(path)
+            except FileNotFoundError as exc:
+                raise ConfigError(f"Fichier de configuration introuvable : {path}") from exc
+            except OSError as exc:
+                raise ConfigError(f"Configuration illisible : {path} : {exc}") from exc
         self._changed = asyncio.Event()
 
     def get(self) -> Config:
@@ -264,8 +280,8 @@ class ConfigStore:
         return self._changed
 
     async def watch(self, stop: asyncio.Event) -> None:
-        """Sonde le mtime du fichier à intervalle POLL_INTERVAL_S, en tâche
-        asyncio (aucun watcher externe) ; retourne quand `stop` est déclenché."""
+        """Sonde le fichier à intervalle POLL_INTERVAL_S, en tâche asyncio
+        (aucun watcher externe) ; retourne quand `stop` est déclenché."""
         if self._path is None:
             return
         while not stop.is_set():
@@ -277,55 +293,76 @@ class ConfigStore:
             await self.poll()
 
     async def poll(self) -> None:
-        """Un sondage : recharge le YAML si son mtime a changé depuis le
-        dernier rechargement (réussi ou rejeté).
+        """Un sondage : recharge le YAML si sa signature (mtime, taille) a
+        changé depuis le dernier rechargement (réussi ou rejeté).
 
         Lecture du fichier hors boucle (to_thread) ; validation intégrale
-        avant tout swap ; une ligne de journal par rechargement, réussi
-        ou rejeté. Le mtime est enregistré dès la tentative : un fichier
-        cassé n'est pas re-testé au sondage suivant tant qu'il ne change
-        plus.
+        avant tout swap ; une ligne de journal par rechargement, réussi ou
+        rejeté — toute erreur de chargement (YAML cassé compris) est
+        journalisée et l'ancienne config reste active : le watcher ne peut
+        jamais mourir d'un mauvais fichier. La signature est enregistrée dès
+        la tentative : un fichier cassé n'est pas re-testé au sondage
+        suivant tant qu'il ne change plus. Après un swap, le fichier est
+        re-staté : un remplacement pendant le chargement ne fige pas une
+        base périmée — re-sondage immédiat.
         """
         if self._path is None:
             return
         try:
-            mtime_ns = (await asyncio.to_thread(os.stat, self._path)).st_mtime_ns
+            signature = await asyncio.to_thread(_stat, self._path)
         except OSError:
-            # Fichier momentanément absent (édition atomique) : le prochain
-            # sondage verra le nouveau fichier.
+            # Fichier absent (édition atomique ou suppression définitive) :
+            # journalisé une seule fois par transition, rechargements
+            # inopérants jusqu'au retour du fichier.
+            if not self._absent_logged:
+                log_line(
+                    f"config file disappeared: {self._path} — rechargements "
+                    "à chaud inopérants jusqu'à son retour"
+                )
+                self._absent_logged = True
             return
-        if mtime_ns == self._mtime_ns:
+        self._absent_logged = False
+        if signature == self._signature:
             return
-        self._mtime_ns = mtime_ns
         try:
             new_config = await asyncio.to_thread(load_config, self._path)
-        except ConfigError as exc:
-            log_line(f"config reload rejected: {exc}")
+        except Exception as exc:  # noqa: BLE001 — un fichier cassé ne tue jamais le watcher
+            detail = str(exc) if isinstance(exc, ConfigError) else f"{type(exc).__name__}: {exc}"
+            log_line(f"config reload rejected: {detail}")
+            self._signature = signature
             return
         current = self._config
         if (new_config.broker_host, new_config.broker_port) != (
             current.broker_host,
             current.broker_port,
         ):
+            self._signature = signature
             log_line(
                 "config reload rejected: broker.host/broker.port modifiés "
-                "(redémarrage requis), ancienne configuration conservée"
+                "(redémarrage requis), ancienne configuration conservée — "
+                "les changements suivants du fichier sont ignorés tant que "
+                "host/port ne sont pas rétablis ou que le démon n'est pas "
+                "redémarré"
             )
             return
         self._config = new_config
         self._changed.set()
+        self._signature = signature
         topics = ",".join(subscription_topics(new_config.rules))
         log_line(
             f"config reloaded rules={len(new_config.rules)} topics={topics}"
         )
+        try:
+            post = await asyncio.to_thread(_stat, self._path)
+        except OSError:
+            post = None
+        if post is not None and post != signature:
+            # Remplacement pendant le chargement : la signature enregistrée
+            # serait périmée — re-sondage immédiat.
+            await self.poll()
 
 
 def load_store_from_env() -> ConfigStore:
     """Construit le ConfigStore depuis MQTT_NOTIF_CONFIG ; échec rapide au démarrage."""
     path = config_path_from_env()
     return ConfigStore(load_config(path), path)
-
-
-def load_config_from_env() -> Config:
-    """Charge la configuration depuis MQTT_NOTIF_CONFIG ; échec rapide au démarrage."""
-    return load_config(config_path_from_env())

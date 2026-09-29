@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import aiomqtt
+import firebase_admin
 import pytest
+from firebase_admin import messaging
 
 from mqtt_notif.config import Config
+from mqtt_notif.notifier import CREDENTIALS_ENV
 from mqtt_notif.rules import Rule, topic_matches
 
 
@@ -24,13 +28,17 @@ class Episode:
 
     - `error` : levée à la connexion (broker injoignable).
     - `drop` : levée après livraison des messages (broker coupé en session).
+    - `queue` : optionnelle — après épuisement de `messages`, les messages
+      suivants arrivent par cette file (livraison pilotable par le test,
+      même connexion établie) au lieu de l'attente silencieuse.
     - ni l'un ni l'autre : connexion silencieuse qui reste établie.
     """
 
-    def __init__(self, messages=(), error=None, drop=None):
+    def __init__(self, messages=(), error=None, drop=None, queue=None):
         self.messages = list(messages)
         self.error = error
         self.drop = drop
+        self.queue = queue
 
 
 class FakeClient:
@@ -86,6 +94,16 @@ class FakeClient:
             for filter_topic, _qos in self.subscribed:
                 if topic_matches(filter_topic, topic):
                     yield message
+        if self._episode.queue is not None:
+            # Suite pilotable : chaque message de la file est livré selon les
+            # souscriptions en vigueur au moment de sa livraison (un topic
+            # désabonné entre-temps ne déclenche plus rien).
+            while True:
+                message = await self._episode.queue.get()
+                topic = str(message.topic)
+                for filter_topic, _qos in self.subscribed:
+                    if topic_matches(filter_topic, topic):
+                        yield message
         if self._episode.drop is not None:
             raise self._episode.drop
         # Connexion silencieuse : reste établie sans rien livrer.
@@ -125,3 +143,36 @@ def config() -> Config:
             ),
         ),
     )
+
+
+@pytest.fixture
+def credentials_env(monkeypatch, tmp_path):
+    path = tmp_path / "service-account.json"
+    path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv(CREDENTIALS_ENV, str(path))
+    return str(path)
+
+
+@pytest.fixture
+def fcm_mock(monkeypatch, credentials_env):
+    """Mocke la frontière firebase-admin ; capture app, messages et thread
+    d'exécution. Forme unique partagée : (appels, threads)."""
+    calls = []
+    sent_from_threads = []
+
+    def fake_certificate(path):
+        return f"credential:{path}"
+
+    def fake_initialize_app(credential=None, **kwargs):
+        return "fake-app"
+
+    def fake_send(message, **kwargs):
+        calls.append(message)
+        sent_from_threads.append(threading.get_ident())
+        if kwargs.get("app") != "fake-app":
+            raise ValueError("app inattendu")
+
+    monkeypatch.setattr(firebase_admin, "initialize_app", fake_initialize_app)
+    monkeypatch.setattr("firebase_admin.credentials.Certificate", fake_certificate)
+    monkeypatch.setattr(messaging, "send", fake_send)
+    return calls, sent_from_threads

@@ -64,38 +64,6 @@ def token_store(token: str) -> ConfigStore:
     )
 
 
-@pytest.fixture
-def credentials_env(monkeypatch, tmp_path):
-    path = tmp_path / "service-account.json"
-    path.write_text("{}", encoding="utf-8")
-    monkeypatch.setenv(CREDENTIALS_ENV, str(path))
-    return str(path)
-
-
-@pytest.fixture
-def fcm_mock(monkeypatch, credentials_env):
-    """Mocke la frontière firebase-admin ; capture app, messages et thread d'exécution."""
-    calls = []
-    sent_from_threads = []
-
-    def fake_certificate(path):
-        return f"credential:{path}"
-
-    def fake_initialize_app(credential=None, **kwargs):
-        return "fake-app"
-
-    def fake_send(message, **kwargs):
-        calls.append(message)
-        sent_from_threads.append(threading.get_ident())
-        if kwargs.get("app") != "fake-app":
-            raise ValueError("app inattendu")
-
-    monkeypatch.setattr(firebase_admin, "initialize_app", fake_initialize_app)
-    monkeypatch.setattr("firebase_admin.credentials.Certificate", fake_certificate)
-    monkeypatch.setattr(messaging, "send", fake_send)
-    return calls, sent_from_threads
-
-
 async def test_send_is_data_only_with_rendered_message(fcm_mock):
     """AC-1.1.2 / AC-1.3.9 : message FCM data-only construit depuis le rendu,
     clés exactes du gabarit, token visé."""
