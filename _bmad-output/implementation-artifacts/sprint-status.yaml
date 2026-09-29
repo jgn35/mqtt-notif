@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-28-2026 15:44
-last_updated: 09-29-2026 16:30
+last_updated: 09-29-2026 17:05
 project: mqtt-notif
 project_key: NOKEY
 tracking_system: file-system
@@ -49,5 +49,5 @@ development_status:
 
   epic-3: in-progress
   3-1-service-systemd-résident: review
-  3-2-règle-réelle-du-bouton-et-validation-terrain-de-sm-1: backlog
+  3-2-règle-réelle-du-bouton-et-validation-terrain-de-sm-1: review
   epic-3-retrospective: optional

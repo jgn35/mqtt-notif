@@ -1,0 +1,74 @@
+# Exemple réel de configuration mqtt-notif — le YAML de production vit sur la
+# machine dédiée (/etc/mqtt-notif/mqtt-notif.yaml, chemin de l'unité systemd).
+# Ce fichier du dépôt ne contient AUCUNE valeur réelle : host et topic du
+# broker sont des exemples à adapter, le device_token est un placeholder.
+# Procédures complètes : docs/EXPLOITATION.md.
+#
+# Schéma strict (validé par mqtt_notif/config.py au chargement) :
+#   - clés racine admises : broker, device_token, rules — toute autre clé
+#     est rejetée ;
+#   - clés de règle admises : name, topic, payload_format, title,
+#     short_message, detailed_message, debounce_ms ;
+#   - requis par règle : name, topic, title, short_message ; optionnels :
+#     payload_format (défaut json) et detailed_message ;
+#   - debounce_ms : entier 0 (défaut, pas de debounce) à 3 600 000 ms ;
+#   - topic : topic exact ou motif MQTT '+'/'#' ('+' = un niveau entier,
+#     '#' = seul au dernier niveau) ;
+#   - gabarits : '{{' pour un '{' littéral, '{chemin.pointe}' pour un champ
+#     du payload JSON, champ absent rendu '[absent]' ;
+#   - en mode raw, seul le placeholder '{payload}' est autorisé.
+#
+# broker.host/broker.port ne peuvent PAS être changés à chaud : le
+# rechargement les refuse explicitement (erreur « redémarrage requis »
+# dans journald) — un changement de broker exige
+# `sudo systemctl restart mqtt-notif`.
+
+broker:
+  # Adresse LAN du broker Mosquitto — À ADAPTER à votre réseau
+  # (192.0.2.10 est une adresse d'exemple, plage de documentation).
+  host: 192.0.2.10
+  # Port MQTT standard, sans TLS ni authentification (périmètre MVP).
+  port: 1883
+
+# Device token FCM du téléphone (app mcp-notif) — PLACEHOLDER.
+# La valeur réelle ne doit JAMAIS être versionnée dans le dépôt : elle ne
+# vit que dans le YAML de production sur la Pi. Rotation : voir la section
+# (4) de docs/EXPLOITATION.md (le token est relu à chaque envoi, la
+# rotation prend effet au prochain envoi sans redémarrage).
+device_token: PLACEHOLDER-DEVICE-TOKEN-A-REMPLACER
+
+rules:
+  # Règle du bouton du salon. Le topic ci-dessous est un EXEMPLE : le topic
+  # réel est confirmé par observation du broker (section (1) de
+  # docs/EXPLOITATION.md — mosquitto_sub), puis reporté ici dans le YAML de
+  # production.
+  - name: bouton-salon
+    topic: home/salon/bouton
+    # payload_format : à trancher par observation du broker (section (1) de
+    # docs/EXPLOITATION.md). Deux cas :
+    #
+    # Cas A — le bouton publie du JSON (dictionnaire), par exemple
+    #   {"action": "press", "source": "salon"} :
+    #   payload_format: json
+    #   title: Bouton salon
+    #   short_message: 'Action : {action}'
+    #   (les gabarits pointent les champs du payload, ex. {action},
+    #   {source.action}, etc. ; un champ absent rend '[absent]'.)
+    #
+    # Cas B — le bouton publie du texte brut, par exemple "press" :
+    #   payload_format: raw
+    #   et les gabarits ne peuvent utiliser QUE le placeholder {payload}.
+    #
+    # Valeur livrée ci-dessous : raw (hypothèse à confirmer sur le terrain).
+    payload_format: raw
+    title: Bouton salon
+    short_message: 'Appui : {payload}'
+    # detailed_message est optionnel ; en mode raw il ne peut citer que
+    # {payload}.
+    detailed_message: 'Payload reçu : {payload}'
+    # Anti-rebond du bouton physique : un seul envoi par fenêtre d'une
+    # seconde, ancrée à la réception du message (pas à l'envoi). Les
+    # messages silenciés sont journalisés « debug: message ignored ».
+    # Un redémarrage du service (volontaire ou par systemd) remet toutes
+    # les fenêtres à zéro (QoS 0, aucun rejeu).
+    debounce_ms: 1000

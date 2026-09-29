@@ -5,6 +5,10 @@ mqtt-notif tourne en service systemd résident sur la machine dédiée
 défaillance, logs dans journald. Le démon n'acquiert aucune capacité
 nouvelle — c'est le même processus que celui testé hors systemd.
 
+Pour l'exploitation courante une fois installé (confirmer le topic du
+bouton, ajouter une règle, mesurer la latence SM-1, tourner le device
+token, journée type), voir `docs/EXPLOITATION.md`.
+
 ## Prérequis
 
 - Raspberry Pi OS avec systemd (journald actif).
