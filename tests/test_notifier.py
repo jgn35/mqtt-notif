@@ -17,6 +17,7 @@ import requests
 from firebase_admin import exceptions, messaging
 
 import mqtt_notif
+from mqtt_notif.config import Config, ConfigStore
 from mqtt_notif.main import Event, SHUTDOWN_TIMEOUT_S
 from mqtt_notif.notifier import (
     CONTRACT_MAX_BYTES,
@@ -55,6 +56,14 @@ RAW_RULE = Rule(
 RAW_EVENT = Event(topic="home/brut", payload="texte brut", rule=RAW_RULE)
 
 
+def token_store(token: str) -> ConfigStore:
+    """Store minimal de test : configuration figée en mémoire, sans fichier
+    (aucun rechargement) — le Notifier lit le token au moment de l'envoi."""
+    return ConfigStore(
+        Config(broker_host="localhost", broker_port=1883, device_token=token, rules=())
+    )
+
+
 @pytest.fixture
 def credentials_env(monkeypatch, tmp_path):
     path = tmp_path / "service-account.json"
@@ -91,7 +100,7 @@ async def test_send_is_data_only_with_rendered_message(fcm_mock):
     """AC-1.1.2 / AC-1.3.9 : message FCM data-only construit depuis le rendu,
     clés exactes du gabarit, token visé."""
     calls, threads = fcm_mock
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(JSON_EVENT)
 
     assert len(calls) == 1
@@ -108,7 +117,7 @@ async def test_send_is_data_only_with_rendered_message(fcm_mock):
 
 async def test_send_logs_fcm_sent(fcm_mock, capsys):
     _, _threads = fcm_mock
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(MINIMAL_EVENT)
     out = capsys.readouterr().out
     assert "fcm sent" in out
@@ -118,7 +127,7 @@ async def test_send_logs_fcm_sent(fcm_mock, capsys):
 async def test_detailed_message_key_only_when_rule_defines_it(fcm_mock):
     """AC-1.3.8 : sans detailed_message dans la règle, seules title et short_message."""
     calls, _threads = fcm_mock
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(MINIMAL_EVENT)
 
     assert calls[0].data == {"title": "Température", "short_message": "21"}
@@ -127,7 +136,7 @@ async def test_detailed_message_key_only_when_rule_defines_it(fcm_mock):
 async def test_send_raw_rule_renders_payload(fcm_mock):
     """Règle raw : '{payload}' substitue le payload brut figé dans l'événement."""
     calls, _threads = fcm_mock
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(RAW_EVENT)
 
     assert calls[0].data == {"title": "Alerte", "short_message": "texte brut"}
@@ -137,7 +146,7 @@ async def test_missing_fields_render_as_absent_and_still_send(fcm_mock):
     """Champ absent -> '[absent]' substitué, notification envoyée quand même."""
     calls, _threads = fcm_mock
     event = Event(topic="home/temp", payload={}, rule=MINIMAL_RULE)
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(event)
 
     assert calls[0].data == {"title": "Température", "short_message": "[absent]"}
@@ -147,7 +156,7 @@ async def test_send_error_logged_service_continues(fcm_mock, monkeypatch, capsys
     """AC-1.1.4 : échec d'envoi journalisé sans crash, envoi suivant traité normalement."""
     calls, _threads = fcm_mock
     monkeypatch.setattr(messaging, "send", lambda *a, **kw: (_ for _ in ()).throw(ValueError("boom")))
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
 
     await notifier.notify(MINIMAL_EVENT)  # échec : jamais d'exception
     first_out = capsys.readouterr().out
@@ -168,7 +177,7 @@ async def test_unregistered_token_logged(fcm_mock, monkeypatch, capsys):
         raise messaging.UnregisteredError("requested entity was not found")
 
     monkeypatch.setattr(messaging, "send", fake_send)
-    notifier = Notifier("token-refuse")
+    notifier = Notifier(token_store("token-refuse"))
     await notifier.notify(MINIMAL_EVENT)
 
     out = capsys.readouterr().out
@@ -179,7 +188,7 @@ async def test_unregistered_token_logged(fcm_mock, monkeypatch, capsys):
 async def test_credentials_env_absent_logged(monkeypatch, capsys):
     """MQTT_NOTIF_FIREBASE_CREDENTIALS absent : erreur journalisée, service continue."""
     monkeypatch.delenv(CREDENTIALS_ENV, raising=False)
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(MINIMAL_EVENT)
 
     out = capsys.readouterr().out
@@ -189,7 +198,7 @@ async def test_credentials_env_absent_logged(monkeypatch, capsys):
 
 async def test_empty_token_logged(credentials_env, capsys):
     """Token vide : erreur explicite journalisée, jamais d'exception."""
-    notifier = Notifier("   ")
+    notifier = Notifier(token_store("   "))
     await notifier.notify(MINIMAL_EVENT)
 
     out = capsys.readouterr().out
@@ -203,7 +212,7 @@ async def test_send_failure_log_traces_topic_and_rule(fcm_mock, monkeypatch, cap
         raise ValueError("boom")
 
     monkeypatch.setattr(messaging, "send", fake_send)
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(MINIMAL_EVENT)
 
     out = capsys.readouterr().out
@@ -221,7 +230,7 @@ async def test_render_failure_logged_with_distinct_label(fcm_mock, monkeypatch, 
         raise RuntimeError("render casse")
 
     monkeypatch.setattr("mqtt_notif.notifier.render_message", broken_render)
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(MINIMAL_EVENT)
 
     out = capsys.readouterr().out
@@ -244,7 +253,7 @@ async def test_initialize_app_called_once(fcm_mock, monkeypatch):
         return "fake-app"
 
     monkeypatch.setattr(firebase_admin, "initialize_app", fake_initialize_app)
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await asyncio.gather(
         notifier.notify(MINIMAL_EVENT),
         notifier.notify(MINIMAL_EVENT),
@@ -303,7 +312,7 @@ async def test_over_limit_title_truncated_at_char_boundary(fcm_mock):
     """AC-1.4.1 / AC-1.4.3 : title > 100 octets UTF-8 tronqué à 100 octets
     exactement, à la frontière de caractère, puis envoyé."""
     calls, _threads = fcm_mock
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(LONG_TITLE_EVENT)
 
     assert len(calls) == 1
@@ -317,7 +326,7 @@ async def test_truncation_never_cuts_mid_character(fcm_mock):
     """AC-1.4.3 : la coupe à 100 octets tombe au milieu d'un 'é' (2 octets) ->
     le caractère amputé est abandonné, jamais de séquence UTF-8 invalide."""
     calls, _threads = fcm_mock
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(MID_CHAR_CUT_EVENT)
 
     title = calls[0].data["title"]
@@ -329,7 +338,7 @@ async def test_short_and_detailed_messages_truncated_to_limits(fcm_mock):
     """AC-1.4.1 : short_message > 500 et detailed_message > 3500 octets ->
     tronqués à leurs limites respectives, toutes les clés dans le contrat."""
     calls, _threads = fcm_mock
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(LONG_FIELDS_EVENT)
 
     data = calls[0].data
@@ -345,7 +354,7 @@ async def test_fields_at_exact_limits_sent_untouched(fcm_mock):
     et total sous la garde FCM -> rien n'est tronqué, le message part
     byte-identique au rendu."""
     calls, _threads = fcm_mock
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(EXACT_LIMITS_EVENT)
 
     data = calls[0].data
@@ -371,7 +380,7 @@ async def test_empty_required_field_refused_no_send_then_service_continues(
     envoi refusé, erreur explicite journalisée, aucun appel FCM, message
     suivant traité normalement."""
     calls, _threads = fcm_mock
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(event)
 
     out = capsys.readouterr().out
@@ -408,7 +417,7 @@ async def test_no_retry_error_logged_once_no_retry(fcm_mock, monkeypatch, capsys
         raise error
 
     monkeypatch.setattr(messaging, "send", fake_send)
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(MINIMAL_EVENT)
 
     out = capsys.readouterr().out
@@ -469,7 +478,7 @@ async def test_retryable_error_retried_with_backoff_then_abandoned(
         raise error_factory()
 
     monkeypatch.setattr(messaging, "send", fake_send)
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(MINIMAL_EVENT)
 
     out = capsys.readouterr().out
@@ -499,7 +508,7 @@ async def test_internal_error_retried_until_success(fcm_mock, monkeypatch, capsy
         calls.append(message)
 
     monkeypatch.setattr(messaging, "send", fake_send)
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(MINIMAL_EVENT)
 
     out = capsys.readouterr().out
@@ -522,7 +531,7 @@ async def test_unmapped_error_is_conservative_no_retry(fcm_mock, monkeypatch, ca
         raise KeyError("erreur inconnue")
 
     monkeypatch.setattr(messaging, "send", fake_send)
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await asyncio.wait_for(notifier.notify(MINIMAL_EVENT), timeout=1.0)
 
     out = capsys.readouterr().out
@@ -561,7 +570,7 @@ async def test_mixed_error_burst_never_crashes_and_service_continues(
         EMPTY_TITLE_EVENT,
         MINIMAL_EVENT,
     ]
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await asyncio.gather(*(notifier.notify(event) for event in rules_and_events))
 
     out = capsys.readouterr().out
@@ -597,7 +606,7 @@ async def test_slow_failing_send_does_not_block_following_sends(fcm_mock, monkey
         calls.append(message)
 
     monkeypatch.setattr(messaging, "send", fake_send)
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     slow_task = asyncio.create_task(notifier.notify(SLOW_FAIL_EVENT))
     await asyncio.to_thread(slow_started.wait)  # le lent est bien en cours dans to_thread
 
@@ -630,7 +639,7 @@ async def test_backoff_delays_actually_slept_in_order(fcm_mock, monkeypatch, cap
         raise messaging.QuotaExceededError("ralenti")
 
     monkeypatch.setattr(messaging, "send", fake_send)
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await asyncio.wait_for(notifier.notify(MINIMAL_EVENT), timeout=5)
 
     assert slept == [0.5, 1.0, 2.0]
@@ -652,7 +661,7 @@ async def test_hung_send_bounded_by_send_timeout(fcm_mock, monkeypatch, capsys):
         time.sleep(1.0)  # HTTP qui ne revient jamais
 
     monkeypatch.setattr(messaging, "send", fake_send)
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     start = time.monotonic()
     await asyncio.wait_for(notifier.notify(MINIMAL_EVENT), timeout=5)
 
@@ -668,7 +677,7 @@ async def test_truncation_is_logged_with_field_topic_and_rule(fcm_mock, capsys):
     """AC-1.4.1 : jamais de perte de contenu silencieuse — chaque troncature
     réelle journalise le champ coupé, avec topic et règle."""
     calls, _threads = fcm_mock
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(LONG_TITLE_EVENT)
 
     out = capsys.readouterr().out
@@ -683,7 +692,7 @@ async def test_total_payload_kept_under_fcm_limit_via_detailed_valve(fcm_mock, c
     (4096) : la garde totale trimé detailed_message (soupape) à la frontière
     de caractère, les autres champs restent à leurs plafonds."""
     calls, _threads = fcm_mock
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(TOTAL_OVERFLOW_EVENT)
 
     data = calls[0].data
@@ -708,7 +717,7 @@ async def test_empty_detailed_message_key_not_sent(fcm_mock, detailed):
         detailed_message=detailed,
     )
     event = Event(topic="home/detail", payload={}, rule=rule)
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(event)
 
     assert calls[0].data == {"title": "T", "short_message": "s"}
@@ -728,7 +737,7 @@ async def test_contract_defensive_against_unexpected_render_output(fcm_mock, mon
             "hors_contrat": "x",  # clé inconnue : ignorée
         },
     )
-    notifier = Notifier("token-abc")
+    notifier = Notifier(token_store("token-abc"))
     await notifier.notify(MINIMAL_EVENT)  # ne lève jamais
 
     assert calls[0].data == {"title": "Titre", "short_message": "21"}

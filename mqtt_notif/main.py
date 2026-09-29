@@ -1,6 +1,11 @@
 """Assemblage du pipeline : source MQTT -> sélection de règle -> envoi FCM,
 boucle asyncio unique.
 
+La sélection lit le snapshot du ConfigStore à chaque message (règle figée
+dans l'événement, jamais relue) ; le store et sa tâche de surveillance du
+YAML (sondage mtime, rechargement à chaud) sont créés à l'assemblage et
+le watcher est arrêté proprement au SIGTERM/SIGINT.
+
 Tâche d'envoi asyncio indépendante par message (la boucle n'attend jamais la
 fin d'un envoi). SIGTERM/SIGINT -> arrêt propre, exit code 0. Erreurs fatales
 uniquement avant le démarrage (config invalide -> exit code non nul) ; après
@@ -16,7 +21,7 @@ import sys
 from dataclasses import dataclass
 
 from . import log_line
-from .config import Config, ConfigError, load_config_from_env
+from .config import ConfigError, ConfigStore, load_store_from_env
 from .mqtt import iter_messages, message_payload
 from .notifier import Notifier
 from .rules import PAYLOAD_FORMAT_RAW, Rule, find_rule
@@ -90,18 +95,21 @@ async def _dispatch(notifier: Notifier, event: Event) -> None:
     await notifier.notify(event)
 
 
-async def run_pipeline(config: Config, notifier: Notifier, stop: asyncio.Event) -> None:
+async def run_pipeline(store: ConfigStore, notifier: Notifier, stop: asyncio.Event) -> None:
     """Consomme la source MQTT et déclenche un envoi FCM par message, sans l'attendre.
 
-    Retourne quand `stop` est observé ; laisse finir les envois en cours, borné
-    dans le temps — au-delà, les envois restants sont annulés et journalisés.
+    La sélection lit `store.get()` à chaque message : la règle gagnante est
+    figée dans l'événement (jamais relue en traversée), un rechargement de
+    configuration prend effet à l'événement suivant. Retourne quand `stop`
+    est observé ; laisse finir les envois en cours, borné dans le temps —
+    au-delà, les envois restants sont annulés et journalisés.
     """
     pending: set[asyncio.Task[None]] = set()
     try:
-        async for message in iter_messages(config, stop):
+        async for message in iter_messages(store, stop):
             topic = str(message.topic)
             log_line(f"mqtt message topic={topic}")
-            event = build_event(config.rules, topic, message_payload(message))
+            event = build_event(store.get().rules, topic, message_payload(message))
             if event is None:
                 log_line(f"message ignored topic={topic} no matching rule")
                 continue
@@ -128,16 +136,22 @@ async def _stop_pipeline(pipeline: asyncio.Task[None]) -> None:
     await asyncio.gather(pipeline, return_exceptions=True)
 
 
-async def serve(config: Config, notifier: Notifier) -> None:
-    """Boucle asyncio unique avec gestion des signaux (SIGTERM/SIGINT -> arrêt propre)."""
+async def serve(store: ConfigStore, notifier: Notifier) -> None:
+    """Boucle asyncio unique avec gestion des signaux (SIGTERM/SIGINT -> arrêt propre).
+
+    Le watcher du ConfigStore (sondage mtime du YAML, rechargement à chaud)
+    vit ici, indépendant des relances du pipeline ; il est arrêté proprement
+    au moment de l'arrêt.
+    """
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
     stopper = asyncio.create_task(stop.wait())
+    watcher = asyncio.create_task(store.watch(stop))
     try:
         while not stop.is_set():
-            pipeline = asyncio.create_task(run_pipeline(config, notifier, stop))
+            pipeline = asyncio.create_task(run_pipeline(store, notifier, stop))
             done, _ = await asyncio.wait(
                 {pipeline, stopper}, return_when=asyncio.FIRST_COMPLETED
             )
@@ -155,6 +169,8 @@ async def serve(config: Config, notifier: Notifier) -> None:
     finally:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.remove_signal_handler(sig)
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
     await stopper
     log_line("mqtt-notif stopped cleanly")
 
@@ -162,12 +178,12 @@ async def serve(config: Config, notifier: Notifier) -> None:
 def main() -> int:
     """Point d'entrée : échec rapide sur config invalide, sinon service résilient."""
     try:
-        config = load_config_from_env()
+        store = load_store_from_env()
     except ConfigError as exc:
         print(f"erreur de configuration : {exc}", file=sys.stderr)
         return 1
-    notifier = Notifier(config.device_token)
-    asyncio.run(serve(config, notifier))
+    notifier = Notifier(store)
+    asyncio.run(serve(store, notifier))
     return 0
 
 

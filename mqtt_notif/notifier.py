@@ -5,7 +5,9 @@ les gabarits de la règle figée dans l'événement (title, short_message,
 detailed_message seulement si la règle le définit), valide le contrat de
 l'app mcp-notif (champs non vides, tailles en octets UTF-8 bornées, charge
 utile totale sous la limite FCM), tronque à la frontière de caractère
-puis envoie le message data-only. Erreurs sans retry (unregistered,
+puis envoie le message data-only. Le device token vient du ConfigStore,
+lu au moment de l'envoi (jamais mis en cache : la rotation YAML prend
+effet au prochain envoi). Erreurs sans retry (unregistered,
 invalid_argument, permission_denied et toute erreur non mappée —
 conservateur) : journalisées, aucun retry. Erreurs avec retry (throttled,
 internal, network_error — envoi bloqué compris) : retries à backoff borné
@@ -26,6 +28,7 @@ import requests
 from firebase_admin import credentials, exceptions, messaging
 
 from . import log_line
+from .config import ConfigStore
 from .render import render_message
 
 if TYPE_CHECKING:  # évite l'import circulaire main -> notifier -> main
@@ -97,10 +100,15 @@ def _error_label(exc: BaseException, policy: tuple[tuple[type[BaseException], st
 
 
 class Notifier:
-    """Émetteur FCM à rédacteur unique : un envoi = une tâche asyncio indépendante."""
+    """Émetteur FCM à rédacteur unique : un envoi = une tâche asyncio indépendante.
 
-    def __init__(self, device_token: str) -> None:
-        self._device_token = device_token
+    Le device token n'est jamais mis en cache ici : il est lu dans le
+    snapshot du ConfigStore au moment de l'envoi — une rotation du token
+    dans le YAML prend effet au prochain envoi, sans redémarrage.
+    """
+
+    def __init__(self, store: ConfigStore) -> None:
+        self._store = store
         self._app: firebase_admin.App | None = None
         self._init_lock = threading.Lock()
 
@@ -237,13 +245,18 @@ class Notifier:
                 await asyncio.sleep(delays[attempt])
 
     def _send(self, data: dict[str, str]) -> None:
-        """Envoi bloquant firebase-admin ; s'exécute exclusivement via to_thread."""
-        if not self._device_token.strip():
+        """Envoi bloquant firebase-admin ; s'exécute exclusivement via to_thread.
+
+        Le device token est relu dans le snapshot du store à chaque envoi
+        (jamais mis en cache) : la rotation prend effet au prochain envoi.
+        """
+        device_token = self._store.get().device_token
+        if not device_token.strip():
             raise ValueError("device token vide")
         app = self._get_app()
         message = messaging.Message(
             data=data,
-            token=self._device_token,
+            token=device_token,
         )
         messaging.send(message, app=app)
 

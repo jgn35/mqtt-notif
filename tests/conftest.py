@@ -50,6 +50,7 @@ class FakeClient:
         self.hostname = hostname
         self.port = port
         self.subscribed = []
+        self.unsubscribed = []
         self.connected_count = 0
 
     async def __aenter__(self):
@@ -66,6 +67,12 @@ class FakeClient:
 
     async def subscribe(self, topic, qos=0):
         self.subscribed.append((str(topic), qos))
+
+    async def unsubscribe(self, topic, **kwargs):
+        """Retire la souscription : un topic désabonné n'est plus livré."""
+        topic = str(topic)
+        self.subscribed = [entry for entry in self.subscribed if entry[0] != topic]
+        self.unsubscribed.append(topic)
 
     @property
     def messages(self):

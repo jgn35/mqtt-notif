@@ -22,7 +22,7 @@ from firebase_admin import messaging
 
 import mqtt_notif.main as main_module
 import mqtt_notif.mqtt as mqtt_module
-from mqtt_notif.config import Config
+from mqtt_notif.config import Config, ConfigStore
 from mqtt_notif.main import build_event, main, run_pipeline, serve
 from mqtt_notif.notifier import CREDENTIALS_ENV, Notifier
 from mqtt_notif.render import MISSING, render_message
@@ -83,7 +83,7 @@ async def test_slow_send_does_not_block_pipeline(fake_broker, config, monkeypatc
 
     guard = asyncio.create_task(stop_when_three_started())
     start = time.monotonic()
-    await asyncio.wait_for(run_pipeline(config, notifier, stop), timeout=10)
+    await asyncio.wait_for(run_pipeline(ConfigStore(config), notifier, stop), timeout=10)
     elapsed = time.monotonic() - start
     await guard
 
@@ -269,7 +269,7 @@ async def test_overlapping_filters_single_notification_per_message(fake_broker, 
     )
     notifier = CountingNotifier()
     stop = asyncio.Event()
-    task = asyncio.create_task(run_pipeline(overlap_config, notifier, stop))
+    task = asyncio.create_task(run_pipeline(ConfigStore(overlap_config), notifier, stop))
 
     seen = ""
     deadline = time.monotonic() + 5
@@ -315,7 +315,7 @@ async def test_hash_rule_end_to_end_notifies_every_message(fake_broker, monkeypa
     )
     notifier = CountingNotifier()
     stop = asyncio.Event()
-    task = asyncio.create_task(run_pipeline(catch_all_config, notifier, stop))
+    task = asyncio.create_task(run_pipeline(ConfigStore(catch_all_config), notifier, stop))
 
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and notifier.calls < 2:
@@ -371,7 +371,7 @@ async def test_two_rules_distinct_templates_two_distinct_notifications(
     )
     notifier = CountingNotifier()
     stop = asyncio.Event()
-    task = asyncio.create_task(run_pipeline(two_rule_config, notifier, stop))
+    task = asyncio.create_task(run_pipeline(ConfigStore(two_rule_config), notifier, stop))
 
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and notifier.calls < 2:
@@ -420,7 +420,7 @@ async def test_pipeline_degraded_json_payload_still_notifies(fake_broker, monkey
     )
     notifier = CountingNotifier()
     stop = asyncio.Event()
-    task = asyncio.create_task(run_pipeline(degraded_config, notifier, stop))
+    task = asyncio.create_task(run_pipeline(ConfigStore(degraded_config), notifier, stop))
 
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and notifier.calls < 1:
@@ -464,7 +464,7 @@ async def test_pipeline_raw_rule_end_to_end(fake_broker, monkeypatch, capsys):
     )
     notifier = CountingNotifier()
     stop = asyncio.Event()
-    task = asyncio.create_task(run_pipeline(raw_config, notifier, stop))
+    task = asyncio.create_task(run_pipeline(ConfigStore(raw_config), notifier, stop))
 
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and notifier.calls < 1:
@@ -491,7 +491,7 @@ async def test_sigterm_stops_serve_cleanly(fake_broker, config, capsys):
     loop = asyncio.get_running_loop()
     loop.call_later(0.1, lambda: os.kill(os.getpid(), signal.SIGTERM))
 
-    await asyncio.wait_for(serve(config, notifier), timeout=5)
+    await asyncio.wait_for(serve(ConfigStore(config), notifier), timeout=5)
 
     out = capsys.readouterr().out
     assert "stopped cleanly" in out
@@ -512,7 +512,7 @@ async def test_pipeline_error_logged_and_restarted(config, monkeypatch, capsys):
     monkeypatch.setattr(main_module, "iter_messages", flaky_iter_messages)
     notifier = SlowNotifier(delay=0.01)
 
-    await asyncio.wait_for(serve(config, notifier), timeout=5)
+    await asyncio.wait_for(serve(ConfigStore(config), notifier), timeout=5)
 
     out = capsys.readouterr().out
     assert "pipeline error (restarting)" in out
@@ -542,7 +542,7 @@ async def test_shutdown_drain_is_bounded(config, monkeypatch, capsys):
 
     monkeypatch.setattr(main_module, "iter_messages", one_message_iter)
 
-    await asyncio.wait_for(run_pipeline(config, notifier, stop), timeout=2)
+    await asyncio.wait_for(run_pipeline(ConfigStore(config), notifier, stop), timeout=2)
 
     assert notifier.calls == 1
     out = capsys.readouterr().out
@@ -568,10 +568,11 @@ async def test_shutdown_drain_bounded_against_retry_loop(fake_broker, config, mo
     episodes.append(
         Episode(messages=[FakeMessage(b'{"valeur": "1"}')], drop=aiomqtt.MqttError("drop"))
     )
-    notifier = Notifier(config.device_token)
+    store = ConfigStore(config)
+    notifier = Notifier(store)
     stop = asyncio.Event()
 
-    task = asyncio.create_task(run_pipeline(config, notifier, stop))
+    task = asyncio.create_task(run_pipeline(store, notifier, stop))
     seen = ""
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:

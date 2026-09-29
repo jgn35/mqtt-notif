@@ -6,16 +6,24 @@ Clés attendues : broker.host, broker.port, device_token, rules
 title/short_message non vides, detailed_message optionnel — syntaxe des
 gabarits validée ici, jamais seulement au rendu). Le chemin du fichier
 vient de MQTT_NOTIF_CONFIG (variable d'environnement).
+
+Le ConfigStore est l'unique lecteur du fichier YAML : il détient la
+configuration courante, la recharge à chaud par sondage mtime (tâche
+asyncio, aucune écriture du fichier) et la remplace en une opération
+atomique. Un YAML invalide (ou broker.host/port modifiés) est rejeté avec
+erreur explicite, l'ancienne configuration reste active.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import unicodedata
 from dataclasses import dataclass
 
 import yaml
 
+from . import log_line
 from .render import TemplateError, validate_template
 from .rules import (
     LEVEL_HASH,
@@ -23,7 +31,13 @@ from .rules import (
     PAYLOAD_FORMAT_JSON,
     PAYLOAD_FORMAT_RAW,
     Rule,
+    subscription_topics,
 )
+
+# Période de sondage mtime du fichier YAML (constante d'implémentation) :
+# le changement prend effet à l'événement suivant, la latence du sondage
+# est masquée par le « prochain événement ».
+POLL_INTERVAL_S = 1.0
 
 
 class ConfigError(Exception):
@@ -32,7 +46,9 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class Config:
-    """Configuration figée lue au démarrage (jamais relue en cours d'exécution)."""
+    """Configuration figée : jamais mutée en place, remplacée en bloc par
+    le ConfigStore (swap atomique) — tout lecteur voit intégralement
+    l'ancienne ou la nouvelle, jamais un mélange."""
 
     broker_host: str
     broker_port: int
@@ -213,6 +229,101 @@ def load_config(path: str) -> Config:
         device_token=device_token,
         rules=rules,
     )
+
+
+class ConfigStore:
+    """Unique lecteur du YAML : détient la configuration courante et la
+    recharge à chaud par sondage mtime.
+
+    `get()` renvoie la Config figée courante : le swap est une simple
+    réaffectation d'attribut, atomique pour tout lecteur — aucune vue
+    mixte possible par construction. Validation intégrale avant tout
+    remplacement : un YAML invalide est rejeté avec erreur explicite
+    journalisée et l'ancienne config reste active. `broker.host/port`
+    modifiés -> rejet explicite « redémarrage requis ». `changed` est armé
+    après chaque swap réussi (consommé par la source MQTT pour
+    resynchroniser ses souscriptions). `path=None` : configuration figée
+    sans fichier, aucun rechargement (tests, assemblages en mémoire).
+    """
+
+    def __init__(self, config: Config, path: str | None = None) -> None:
+        self._config = config
+        self._path = path
+        self._mtime_ns: int | None = (
+            os.stat(path).st_mtime_ns if path is not None else None
+        )
+        self._changed = asyncio.Event()
+
+    def get(self) -> Config:
+        """Snapshot figé de la configuration courante (jamais de vue mixte)."""
+        return self._config
+
+    @property
+    def changed(self) -> asyncio.Event:
+        """Armé après chaque swap réussi ; consommé (clear) par la source MQTT."""
+        return self._changed
+
+    async def watch(self, stop: asyncio.Event) -> None:
+        """Sonde le mtime du fichier à intervalle POLL_INTERVAL_S, en tâche
+        asyncio (aucun watcher externe) ; retourne quand `stop` est déclenché."""
+        if self._path is None:
+            return
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=POLL_INTERVAL_S)
+                return
+            except TimeoutError:
+                pass
+            await self.poll()
+
+    async def poll(self) -> None:
+        """Un sondage : recharge le YAML si son mtime a changé depuis le
+        dernier rechargement (réussi ou rejeté).
+
+        Lecture du fichier hors boucle (to_thread) ; validation intégrale
+        avant tout swap ; une ligne de journal par rechargement, réussi
+        ou rejeté. Le mtime est enregistré dès la tentative : un fichier
+        cassé n'est pas re-testé au sondage suivant tant qu'il ne change
+        plus.
+        """
+        if self._path is None:
+            return
+        try:
+            mtime_ns = (await asyncio.to_thread(os.stat, self._path)).st_mtime_ns
+        except OSError:
+            # Fichier momentanément absent (édition atomique) : le prochain
+            # sondage verra le nouveau fichier.
+            return
+        if mtime_ns == self._mtime_ns:
+            return
+        self._mtime_ns = mtime_ns
+        try:
+            new_config = await asyncio.to_thread(load_config, self._path)
+        except ConfigError as exc:
+            log_line(f"config reload rejected: {exc}")
+            return
+        current = self._config
+        if (new_config.broker_host, new_config.broker_port) != (
+            current.broker_host,
+            current.broker_port,
+        ):
+            log_line(
+                "config reload rejected: broker.host/broker.port modifiés "
+                "(redémarrage requis), ancienne configuration conservée"
+            )
+            return
+        self._config = new_config
+        self._changed.set()
+        topics = ",".join(subscription_topics(new_config.rules))
+        log_line(
+            f"config reloaded rules={len(new_config.rules)} topics={topics}"
+        )
+
+
+def load_store_from_env() -> ConfigStore:
+    """Construit le ConfigStore depuis MQTT_NOTIF_CONFIG ; échec rapide au démarrage."""
+    path = config_path_from_env()
+    return ConfigStore(load_config(path), path)
 
 
 def load_config_from_env() -> Config:

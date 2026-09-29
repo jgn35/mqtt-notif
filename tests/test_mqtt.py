@@ -12,7 +12,7 @@ import aiomqtt
 import pytest
 
 import mqtt_notif.mqtt as mqtt_module
-from mqtt_notif.config import Config
+from mqtt_notif.config import Config, ConfigStore
 from mqtt_notif.mqtt import RECONNECT_BACKOFF_INITIAL, RECONNECT_BACKOFF_MAX, iter_messages, message_payload
 from mqtt_notif.rules import Rule
 
@@ -32,7 +32,7 @@ async def test_connect_subscribe_and_log(fake_broker, config, capsys):
     stop = asyncio.Event()
 
     got = []
-    async for message in iter_messages(config, stop):
+    async for message in iter_messages(ConfigStore(config), stop):
         got.append(message_payload(message))
         stop.set()
 
@@ -67,7 +67,7 @@ async def test_multi_rule_subscriptions_and_resubscribe_on_reconnect(fake_broker
     stop = asyncio.Event()
 
     got = []
-    async for message in iter_messages(multi_config, stop):
+    async for message in iter_messages(ConfigStore(multi_config), stop):
         got.append(message_payload(message))
         if len(got) == 2:
             stop.set()
@@ -136,7 +136,7 @@ async def test_reconnect_after_drop(fake_broker, config, capsys):
     stop = asyncio.Event()
 
     got = []
-    async for message in iter_messages(config, stop):
+    async for message in iter_messages(ConfigStore(config), stop):
         got.append(message_payload(message))
         if len(got) == 2:
             stop.set()
@@ -169,7 +169,7 @@ async def test_backoff_grows_and_never_stops(fake_broker, config, monkeypatch, c
 
     monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
 
-    async for _message in iter_messages(config, stop):
+    async for _message in iter_messages(ConfigStore(config), stop):
         pass
 
     assert recorded == [
@@ -197,7 +197,7 @@ async def test_backoff_capped(fake_broker, config, monkeypatch):
 
     monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
 
-    async for _message in iter_messages(config, stop):
+    async for _message in iter_messages(ConfigStore(config), stop):
         pass
 
     assert max(recorded) == RECONNECT_BACKOFF_MAX
@@ -210,7 +210,7 @@ async def test_stop_during_backoff_returns(fake_broker, config, monkeypatch, cap
     stop = asyncio.Event()
 
     async def consume():
-        async for _message in iter_messages(config, stop):
+        async for _message in iter_messages(ConfigStore(config), stop):
             pass
 
     task = asyncio.create_task(consume())
