@@ -9,6 +9,7 @@ import re
 import time
 
 import aiomqtt
+import pytest
 
 import mqtt_notif.mqtt as mqtt_module
 from mqtt_notif.config import Config
@@ -74,6 +75,16 @@ async def test_multi_rule_subscriptions_and_resubscribe_on_reconnect(fake_broker
     assert got == ["1", "2"]
     assert clients[0].subscribed == expected
     assert clients[1].subscribed == expected
+    # Les deux logs opérationnels montrent l'ensemble fusionné complet :
+    # seule vue observable du sur-ensemble côté démon.
+    out = get_lines(capsys)
+    connection_lines = [
+        line for line in out if "mqtt connected" in line or "mqtt reconnected" in line
+    ]
+    assert len(connection_lines) == 2
+    assert any("mqtt connected" in line for line in connection_lines)
+    assert any("mqtt reconnected" in line for line in connection_lines)
+    assert all("topics=garage/#,home/salon/capteur qos=0" in line for line in connection_lines)
 
 
 async def test_fake_broker_delivers_once_per_matching_subscription():
@@ -96,16 +107,22 @@ async def test_fake_broker_delivers_once_per_matching_subscription():
 
 
 async def test_fake_broker_single_delivery_for_disjoint_subscriptions():
-    """Souscriptions deux à deux disjointes : le même topic n'est livré qu'une fois."""
-    episodes = [Episode(messages=[FakeMessage(b"x", topic="home/salon/capteur")])]
+    """Souscriptions deux à deux disjointes : le même topic n'est livré qu'une fois.
+
+    L'épisode se termine par un drop : sans break prématuré, une livraison
+    dupliquée serait effectivement observée et ferait échouer l'assertion.
+    """
+    episodes = [
+        Episode(messages=[FakeMessage(b"x", topic="home/salon/capteur")], drop=aiomqtt.MqttError("drop"))
+    ]
     client = FakeClient(episodes)
     async with client:
         await client.subscribe("home/+/+", qos=0)  # plus petit sur-ensemble fusionné
         await client.subscribe("garage/#", qos=0)
         deliveries = []
-        async for message in client.messages:
-            deliveries.append(message)
-            break
+        with pytest.raises(aiomqtt.MqttError):
+            async for message in client.messages:
+                deliveries.append(message)
     assert len(deliveries) == 1
 
 

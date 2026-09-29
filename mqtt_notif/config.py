@@ -55,8 +55,8 @@ def _validate_topic_pattern(topic: str, name: str) -> None:
 
     if any(char.isspace() for char in topic):
         invalid("espaces interdits")
-    if any(unicodedata.category(char) == "Cc" for char in topic):
-        invalid("caractères de contrôle interdits")
+    if any(unicodedata.category(char) in ("Cc", "Cf") for char in topic):
+        invalid("caractères de contrôle ou de format interdits")
     segments = topic.split("/")
     for position, segment in enumerate(segments):
         is_last = position == len(segments) - 1
@@ -77,7 +77,7 @@ def _validate_rule(entry: object, index: int) -> Rule:
             f"{label} : clé 'name' manquante ou invalide (chaîne non vide attendue)"
         )
     name = name.strip()
-    unknown_keys = sorted(set(entry) - {"name", "topic"})
+    unknown_keys = sorted(set(entry) - {"name", "topic"}, key=str)
     if unknown_keys:
         raise ConfigError(
             f"Règle '{name}' : clé(s) inconnue(s) {unknown_keys} "
@@ -148,6 +148,15 @@ def load_config(path: str) -> Config:
     device_token = device_token.strip()
 
     rules = _validate_rules(raw.get("rules"))
+
+    unknown_root_keys = sorted(set(raw) - {"broker", "device_token", "rules"}, key=str)
+    if unknown_root_keys:
+        hint = (
+            " ('topic' a été remplacé par la section 'rules')"
+            if "topic" in unknown_root_keys
+            else ""
+        )
+        raise ConfigError(f"Clé(s) inconnue(s) à la racine : {unknown_root_keys}{hint}")
 
     return Config(
         broker_host=host,

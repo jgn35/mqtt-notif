@@ -28,14 +28,6 @@ from .conftest import Episode, FakeMessage
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-RULES_YAML = textwrap.dedent(
-    """\
-    rules:
-      - name: salon
-        topic: home/salon/capteur
-    """
-)
-
 
 class SlowNotifier:
     """Notifier lent : enregistre les démarrages et les fins d'envoi."""
@@ -120,8 +112,10 @@ def test_build_event_single_match_no_warning(capsys):
 
 
 def test_build_event_no_match_returns_none(capsys):
+    """Aucune correspondance : pas d'événement, pas d'avertissement multi-correspondances."""
     event = build_event((Rule(name="salon", topic="home/salon/capteur"),), "home/cave/temp", "p")
     assert event is None
+    assert "warning" not in capsys.readouterr().out
 
 
 def test_event_is_frozen(config):
@@ -197,6 +191,46 @@ async def test_overlapping_filters_single_notification_per_message(fake_broker, 
     assert out.count("mqtt message topic=") == 3
     assert "message ignored topic=home/cave/temp no matching rule" in out
     assert "message ignored topic=home/salon/capteur" not in out
+
+
+async def test_hash_rule_end_to_end_notifies_every_message(fake_broker, monkeypatch, capsys):
+    """Règle attrape-tout '#' : chaque message livré produit exactement une notification.
+
+    Deux topics sans rapport entre eux, tous deux couverts par la souscription
+    unique '#' — aucun message ignoré, aucun avertissement multi-correspondances.
+    """
+    episodes, clients = fake_broker
+    monkeypatch.setattr(mqtt_module, "RECONNECT_BACKOFF_INITIAL", 0.01)
+    catch_all_config = Config(
+        broker_host="localhost",
+        broker_port=1883,
+        device_token="t",
+        rules=(Rule(name="tout", topic="#"),),
+    )
+    episodes.append(
+        Episode(
+            messages=[
+                FakeMessage(b"1", topic="home/salon/capteur"),
+                FakeMessage(b"2", topic="garage/portail"),
+            ],
+            drop=aiomqtt.MqttError("drop"),
+        )
+    )
+    notifier = CountingNotifier()
+    stop = asyncio.Event()
+    task = asyncio.create_task(run_pipeline(catch_all_config, notifier, stop))
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and notifier.calls < 2:
+        await asyncio.sleep(0.02)
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
+
+    assert clients[0].subscribed == [("#", 0)]
+    assert notifier.calls == 2
+    out = capsys.readouterr().out
+    assert "warning" not in out
+    assert "no matching rule" not in out
 
 
 async def test_sigterm_stops_serve_cleanly(fake_broker, config, capsys):

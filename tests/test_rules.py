@@ -37,6 +37,14 @@ from mqtt_notif.rules import (
         ("#", "nimporte/quoi", True),
         # Sensible à la casse
         ("home/+/capteur", "home/salon/CAPTEUR", False),
+        # Topic exact avec métacaractères regex (chemin re.escape : '.', '*')
+        ("home/a.b/x", "home/a.b/x", True),
+        ("home/a.b/x", "home/aXb/x", False),
+        ("home/a.b/x", "home/a.b", False),
+        ("home/a*b/x", "home/a*b/x", True),
+        ("home/a*b/x", "home/aXb/x", False),
+        ("home/+/c.d", "home/salon/c.d", True),
+        ("home/+/c.d", "home/salon/cXd", False),
     ],
 )
 def test_topic_matches(pattern, topic, expected):

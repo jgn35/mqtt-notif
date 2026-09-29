@@ -36,11 +36,12 @@ class Episode:
 class FakeClient:
     """Remplace aiomqtt.Client : consomme une liste partagée d'épisodes.
 
-    Fidèle à la sémantique broker : un message est livré une fois par
-    souscription correspondante (filtres '+'/'#' évalués par topic_matches) —
-    des souscriptions chevauchantes dupliquent donc la livraison, comme sur
-    un vrai broker. Épisodes épuisés -> erreur de connexion (broker
-    définitivement injoignable).
+    Un broker MQTT peut livrer un message une fois par souscription
+    correspondante (filtres '+'/'#' évalués par topic_matches) — MQTT
+    3.1.1 § 3.3.5 l'autorise aussi en copie unique ; le faux broker
+    choisit la livraison multiple, pire cas exposant tout doublon.
+    Épisodes épuisés -> erreur de connexion (broker définitivement
+    injoignable).
     """
 
     def __init__(self, episodes, hostname="", port=0):
@@ -72,8 +73,8 @@ class FakeClient:
 
     async def _iter_messages(self):
         for message in self._episode.messages:
-            # Une livraison par souscription correspondante, dans l'ordre
-            # des souscriptions prises sur ce client.
+            # Livraison possible une fois par souscription correspondante,
+            # dans l'ordre des souscriptions prises sur ce client.
             topic = str(message.topic)
             for filter_topic, _qos in self.subscribed:
                 if topic_matches(filter_topic, topic):

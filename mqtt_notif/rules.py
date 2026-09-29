@@ -3,8 +3,9 @@
 Une règle (nom unique, topic exact ou motif '+'/'#') est figée dans
 l'événement au moment de la sélection. L'évaluation première-gagnante
 porte sur la liste complète des règles ; les souscriptions retenues
-sont deux à deux disjointes — un broker MQTT livre un message une fois
-par souscription correspondante, des filtres chevauchants entraîneraient
+sont deux à deux disjointes — un broker MQTT peut livrer un message
+une fois par souscription correspondante (MQTT 3.1.1 § 3.3.5 autorise
+aussi une copie unique), des filtres chevauchants entraîneraient
 des notifications en double.
 """
 
@@ -140,9 +141,10 @@ def _least_upper_bound(first: str, second: str) -> str:
 def subscription_topics(rules: tuple[Rule, ...]) -> tuple[str, ...]:
     """Souscriptions deux à deux disjointes couvrant l'union des topics des règles.
 
-    Un broker MQTT livre un message une fois par souscription correspondante :
-    des filtres chevauchants (partiellement ou par contenance) provoqueraient
-    des doublons. Deux filtres dont les langages s'intersectent sont fusionnés
+    Un broker MQTT peut livrer un message une fois par souscription
+    correspondante : des filtres chevauchants (partiellement ou par
+    contenance) provoqueraient des doublons. Deux filtres dont les langages
+    s'intersectent sont fusionnés
     en leur plus petit sur-ensemble MQTT, itéré jusqu'au point fixe ; les
     doublons exacts sont abonnés une seule fois. Les topics supplémentaires
     couverts par un sur-ensemble mais hors règles sont ignorés par la

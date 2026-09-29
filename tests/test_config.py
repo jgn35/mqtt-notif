@@ -35,6 +35,12 @@ def write_yaml(tmp_path, content):
 
 
 def rule_yaml(topic, name="salon"):
+    r"""Section rules minimale avec une seule règle.
+
+    Le topic est écrit en style double-quoted : PyYAML y décode les escapes
+    ("\x00", "\u200b") en caractères réels. Passer en style plain rendrait
+    ces tests trivialement verts sans couvrir la validation Cc/Cf.
+    """
     return f'rules:\n  - name: {name}\n    topic: "{topic}"\n'
 
 
@@ -84,8 +90,10 @@ def test_wildcard_patterns_are_legal(tmp_path, topic):
         ("home/#x", "'#'"),
         ("home/ho+me", "'+' doit occuper un niveau entier"),
         ("home/salon capteur", "espaces interdits"),
-        ("home/\\x00salon", "caractères de contrôle interdits"),
-        ("home/salon\\x7f", "caractères de contrôle interdits"),
+        ("home/\\x00salon", "caractères de contrôle ou de format interdits"),
+        ("home/salon\\x7f", "caractères de contrôle ou de format interdits"),
+        ("home/\\u200bsalon", "caractères de contrôle ou de format interdits"),
+        ("home/\\ufeff", "caractères de contrôle ou de format interdits"),
     ],
 )
 def test_invalid_topic_syntax_rejected(tmp_path, topic, expected):
@@ -132,6 +140,32 @@ def test_rule_unknown_key_rejected(tmp_path):
         load_config(str(write_yaml(tmp_path, content)))
     assert "topick" in str(excinfo.value)
     assert "salon" in str(excinfo.value)
+
+
+def test_rule_unknown_keys_mixed_types(tmp_path):
+    """Clés inconnues de types mixtes (YAML '42:' + 'topick:') : ConfigError, pas de TypeError."""
+    content = BROKER_YAML + "rules:\n  - name: salon\n    42: x\n    topick: home/x\n"
+    with pytest.raises(ConfigError, match="inconnue") as excinfo:
+        load_config(str(write_yaml(tmp_path, content)))
+    assert "42" in str(excinfo.value)
+    assert "topick" in str(excinfo.value)
+
+
+def test_root_unknown_key_rejected(tmp_path):
+    """Les clés racine inconnues sont rejetées, comme celles des entrées de règle."""
+    content = VALID_YAML + "\nextra: valeur\n"
+    with pytest.raises(ConfigError, match="inconnue") as excinfo:
+        load_config(str(write_yaml(tmp_path, content)))
+    assert "extra" in str(excinfo.value)
+
+
+def test_legacy_topic_root_key_migration_hint(tmp_path):
+    """La clé 'topic' de la story 1.1 est rejetée avec un indice de migration vers 'rules'."""
+    content = VALID_YAML + "\ntopic: home/salon/capteur\n"
+    with pytest.raises(ConfigError, match="remplacé") as excinfo:
+        load_config(str(write_yaml(tmp_path, content)))
+    assert "'topic'" in str(excinfo.value)
+    assert "rules" in str(excinfo.value)
 
 
 def test_duplicate_rule_names_rejected(tmp_path):
