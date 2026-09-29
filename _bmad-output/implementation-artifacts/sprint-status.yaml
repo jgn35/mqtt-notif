@@ -47,7 +47,7 @@ development_status:
   2-2-debounce-par-règle: review
   epic-2-retrospective: optional
 
-  epic-3: backlog
-  3-1-service-systemd-résident: backlog
+  epic-3: in-progress
+  3-1-service-systemd-résident: in-progress
   3-2-règle-réelle-du-bouton-et-validation-terrain-de-sm-1: backlog
   epic-3-retrospective: optional
