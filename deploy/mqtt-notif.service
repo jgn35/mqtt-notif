@@ -1,0 +1,42 @@
+# mqtt-notif — unité systemd du service résident.
+# Les chemins des Environment= ci-dessous sont des EXEMPLES pour la machine
+# dédiée (/etc/mqtt-notif/, /var/lib/mqtt-notif/) : adaptez-les au déploiement
+# réel (voir deploy/README.md). Le démon ne code aucun chemin en dur — il lit
+# MQTT_NOTIF_CONFIG et MQTT_NOTIF_FIREBASE_CREDENTIALS au démarrage.
+
+[Unit]
+Description=MQTT to FCM notification bridge
+Documentation=file:///opt/mqtt-notif/deploy/README.md
+# Le démon se reconnecte de lui-même au broker : attendre le réseau au
+# démarrage évite seulement la première salve de reconnexions journalisée.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Utilisateur dédié non-root, créé par deploy/install.sh.
+User=mqtt-notif
+Group=mqtt-notif
+# Chemins d'exemple de la machine dédiée — à adapter au déploiement.
+Environment=MQTT_NOTIF_CONFIG=/etc/mqtt-notif/mqtt-notif.yaml
+Environment=MQTT_NOTIF_FIREBASE_CREDENTIALS=/var/lib/mqtt-notif/service-account.json
+# Console script du venv installé par deploy/install.sh (entrée pyproject :
+# mqtt-notif = mqtt_notif.main:main).
+ExecStart=/opt/mqtt-notif/.venv/bin/mqtt-notif
+# kill -9 du processus -> relance par systemd ; les fenêtres de debounce
+# repartent à zéro (QoS 0, aucun rejeu, comportement assumé).
+Restart=on-failure
+RestartSec=5
+# Réglage de démarrage laissé au déploiement (défauts systemd : 5 / 10s) :
+# au-delà de StartLimitBurst démarrages dans StartLimitIntervalSec, systemd
+# marque l'unité failed — l'échec de démarrage (YAML absent, service-account
+# manquant) reste visible dans journald, pas de boucle silencieuse.
+#StartLimitBurst=5
+#StartLimitIntervalSec=10s
+# Pas de fichier de log propre : stdout/stderr -> journald par défaut,
+# lisible via `journalctl -u mqtt-notif` (timestamps ISO 8601 UTC du démon).
+# systemctl stop -> SIGTERM -> déconnexion propre du broker, exit 0,
+# état inactive (pas failed).
+
+[Install]
+WantedBy=multi-user.target
