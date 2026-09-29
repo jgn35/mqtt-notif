@@ -44,7 +44,7 @@ development_status:
 
   epic-2: in-progress
   2-1-rechargement-à-chaud-avec-swap-atomique: review
-  2-2-debounce-par-règle: backlog
+  2-2-debounce-par-règle: in-progress
   epic-2-retrospective: optional
 
   epic-3: backlog
