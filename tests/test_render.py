@@ -109,7 +109,9 @@ def test_render_message_never_raises_on_any_payload():
     for payload in ({}, {"a": {"b": "c"}}, {"capteur": 3}):
         message = render_message(JSON_RULE, payload)
         assert set(message) == {"title", "short_message", "detailed_message"}
-        assert MISSING in message["title"] or payload == {"a": {"b": "c"}}
+        # Le gabarit titre référence {capteur.lieu} : absent, chemin traversant
+        # un non-dict — tous rendent [absent] pour ces payloads.
+        assert message["title"] == f"Capteur {MISSING}"
 
 
 @pytest.mark.parametrize(
@@ -129,6 +131,9 @@ def test_validate_template_rejects_placeholder_with_space(template):
         ("Alerte {}", "placeholder vide"),
         ("Alerte {ch{amp}", "'{' interdit dans un placeholder"),
         ("{ champ}", "placeholder avec espace interdit"),
+        ("{a.}", "segment de chemin vide"),
+        ("{.a}", "segment de chemin vide"),
+        ("{a..b}", "segment de chemin vide"),
     ],
 )
 def test_validate_template_malformed(template, reason):

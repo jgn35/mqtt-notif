@@ -186,14 +186,32 @@ def test_build_event_unparsable_json_payload_warns_and_renders_absent(capsys):
 
 
 def test_build_event_non_dict_json_payload_warns_and_renders_absent(capsys):
-    """JSON parsable mais non-dict (liste, scalaire) : champs tous absents + avertissement."""
+    """JSON parsable mais non-objet (liste, scalaire) : message distinct + champs absents."""
     event = build_event(
         (Rule(name="c", topic="home/x", title="T", short_message="{a}"),),
         "home/x",
         "[1, 2]",
     )
-    assert "payload json non parsable" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "payload json non-objet" in out
+    assert "payload json non parsable" not in out
     assert event.payload == {}
+    assert render_message(event.rule, event.payload)["short_message"] == MISSING
+
+
+def test_build_event_deeply_nested_json_payload_never_crashes(capsys):
+    """Payload profondément imbriqué : RecursionError capté, jamais de crash
+    ni de message ignoré en bloc — rendu comme si tous les champs étaient absents."""
+    deep = "[" * 100000 + "]" * 100000
+    event = build_event(
+        (Rule(name="c", topic="home/x", title="T", short_message="{a}"),),
+        "home/x",
+        deep,
+    )
+    out = capsys.readouterr().out
+    assert "payload json non parsable" in out
+    assert event.payload == {}
+    assert render_message(event.rule, event.payload)["short_message"] == MISSING
 
 
 def test_build_event_raw_payload_kept_as_string(capsys):
@@ -371,6 +389,94 @@ async def test_two_rules_distinct_templates_two_distinct_notifications(
             "short_message": "salon : 21 degrés",
         },
     }
+
+
+async def test_pipeline_degraded_json_payload_still_notifies(fake_broker, monkeypatch, capsys):
+    """AC-1.3.2 bout en bout : payload non-JSON sur une règle json -> avertissement
+    journalisé, la notification part quand même, rendue tout '[absent]'."""
+    episodes, _clients = fake_broker
+    monkeypatch.setattr(mqtt_module, "RECONNECT_BACKOFF_INITIAL", 0.01)
+    degraded_config = Config(
+        broker_host="localhost",
+        broker_port=1883,
+        device_token="t",
+        rules=(
+            Rule(
+                name="capteur",
+                topic="home/salon/capteur",
+                title="Capteur",
+                short_message="Valeur: {valeur}",
+            ),
+        ),
+    )
+    episodes.append(
+        Episode(
+            messages=[FakeMessage(b"pas du tout du json", topic="home/salon/capteur")],
+            drop=aiomqtt.MqttError("drop"),
+        )
+    )
+    notifier = CountingNotifier()
+    stop = asyncio.Event()
+    task = asyncio.create_task(run_pipeline(degraded_config, notifier, stop))
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and notifier.calls < 1:
+        await asyncio.sleep(0.02)
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
+
+    assert notifier.calls == 1
+    event = notifier.events[0]
+    assert event.payload == {}
+    assert render_message(event.rule, event.payload)["short_message"] == f"Valeur: {MISSING}"
+    out = capsys.readouterr().out
+    assert "payload json non parsable" in out
+    assert "topic=home/salon/capteur" in out
+
+
+async def test_pipeline_raw_rule_end_to_end(fake_broker, monkeypatch, capsys):
+    """AC-1.3.5 bout en bout : règle raw '{payload}' -> payload brut figé à la
+    sélection, rendu et envoyé sans parsing ni avertissement."""
+    episodes, _clients = fake_broker
+    monkeypatch.setattr(mqtt_module, "RECONNECT_BACKOFF_INITIAL", 0.01)
+    raw_config = Config(
+        broker_host="localhost",
+        broker_port=1883,
+        device_token="t",
+        rules=(
+            Rule(
+                name="brut",
+                topic="home/brut",
+                payload_format=PAYLOAD_FORMAT_RAW,
+                title="Alerte",
+                short_message="{payload}",
+            ),
+        ),
+    )
+    episodes.append(
+        Episode(
+            messages=[FakeMessage(b"porte ouverte", topic="home/brut")],
+            drop=aiomqtt.MqttError("drop"),
+        )
+    )
+    notifier = CountingNotifier()
+    stop = asyncio.Event()
+    task = asyncio.create_task(run_pipeline(raw_config, notifier, stop))
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and notifier.calls < 1:
+        await asyncio.sleep(0.02)
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
+
+    assert notifier.calls == 1
+    event = notifier.events[0]
+    assert event.payload == "porte ouverte"
+    assert render_message(event.rule, event.payload) == {
+        "title": "Alerte",
+        "short_message": "porte ouverte",
+    }
+    assert "warning" not in capsys.readouterr().out
 
 
 async def test_sigterm_stops_serve_cleanly(fake_broker, config, capsys):

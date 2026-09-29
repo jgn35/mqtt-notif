@@ -39,19 +39,31 @@ class Notifier:
         """Rend le message depuis l'événement puis envoie le FCM via to_thread.
 
         Ne lève jamais : toute erreur (rendu, identifiants absents, token
-        refusé, échec réseau) est journalisée, le service continue.
+        refusé, échec réseau) est journalisée avec topic et règle pour
+        retracer la notification fautive, le service continue.
         """
         try:
             data = render_message(event.rule, event.payload)
+        except Exception as exc:  # noqa: BLE001 — erreurs de rendu jamais fatales
+            log_line(
+                f"render failed error={type(exc).__name__}: {exc} "
+                f"topic={event.topic} rule={event.rule.name}"
+            )
+            return
+        try:
             await asyncio.to_thread(self._send, data)
             log_line(f"fcm sent topic={event.topic}")
         except messaging.UnregisteredError:
             log_line(
                 "fcm send failed: device token absent ou refusé (unregistered), "
-                "messages suivants traités normalement"
+                f"messages suivants traités normalement topic={event.topic} "
+                f"rule={event.rule.name}"
             )
         except Exception as exc:  # noqa: BLE001 — erreurs d'envoi jamais fatales
-            log_line(f"fcm send failed error={type(exc).__name__}: {exc}")
+            log_line(
+                f"fcm send failed error={type(exc).__name__}: {exc} "
+                f"topic={event.topic} rule={event.rule.name}"
+            )
 
     def _send(self, data: dict[str, str]) -> None:
         """Envoi bloquant firebase-admin ; s'exécute exclusivement via to_thread."""

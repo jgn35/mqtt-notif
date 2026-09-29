@@ -39,19 +39,25 @@ class Event:
 def _parse_payload(raw: str, rule: Rule, topic: str) -> dict[str, object] | str:
     """Parse le payload selon payload_format de la règle gagnante.
 
-    Règle json : dict attendu ; payload non parsable (ou non-dict) -> dict
-    vide + avertissement journalisé — le rendu voit tous les champs absents,
-    le message n'est jamais ignoré en bloc.
+    Règle json : dict attendu ; payload non parsable (RecursionError compris,
+    payloads profondément imbriqués) -> dict vide + avertissement journalisé ;
+    JSON parsable mais non-objet -> dict vide + avertissement distinct. Dans
+    les deux cas le rendu voit tous les champs absents, le message n'est
+    jamais ignoré en bloc.
     """
     if rule.payload_format == PAYLOAD_FORMAT_RAW:
         return raw
     try:
         parsed = json.loads(raw)
-    except ValueError:
-        parsed = None
-    if not isinstance(parsed, dict):
+    except (ValueError, RecursionError):
         log_line(
             f"warning: payload json non parsable topic={topic} rule={rule.name}, "
+            "rendu comme si tous les champs étaient absents"
+        )
+        return {}
+    if not isinstance(parsed, dict):
+        log_line(
+            f"warning: payload json non-objet topic={topic} rule={rule.name}, "
             "rendu comme si tous les champs étaient absents"
         )
         return {}

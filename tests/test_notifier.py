@@ -179,6 +179,44 @@ async def test_empty_token_logged(credentials_env, capsys):
     assert "token vide" in out
 
 
+async def test_send_failure_log_traces_topic_and_rule(fcm_mock, monkeypatch, capsys):
+    """Échec d'envoi : la ligne de log porte topic et règle (notification traçable)."""
+
+    def fake_send(message, **kwargs):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(messaging, "send", fake_send)
+    notifier = Notifier("token-abc")
+    await notifier.notify(MINIMAL_EVENT)
+
+    out = capsys.readouterr().out
+    assert "fcm send failed" in out
+    assert "topic=home/temp" in out
+    assert "rule=temp" in out
+
+
+async def test_render_failure_logged_with_distinct_label(fcm_mock, monkeypatch, capsys):
+    """Erreur de rendu : étiquette 'render failed' distincte, jamais confondue
+    avec un échec d'envoi FCM, et aucun envoi n'est tenté."""
+    calls, _threads = fcm_mock
+
+    def broken_render(rule, payload):
+        raise RuntimeError("render casse")
+
+    monkeypatch.setattr("mqtt_notif.notifier.render_message", broken_render)
+    notifier = Notifier("token-abc")
+    await notifier.notify(MINIMAL_EVENT)
+
+    out = capsys.readouterr().out
+    assert "render failed" in out
+    assert "render casse" in out
+    assert "topic=home/temp" in out
+    assert "rule=temp" in out
+    assert "fcm send failed" not in out
+    assert "fcm sent" not in out
+    assert calls == []
+
+
 async def test_initialize_app_called_once(fcm_mock, monkeypatch):
     """Plusieurs envois : firebase-admin initialisé une seule fois."""
     calls, _threads = fcm_mock

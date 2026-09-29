@@ -5,6 +5,8 @@ logique scriptée) : '{{' -> '{' littéral, '{chemin}' -> valeur résolue par
 segments dans le dict du payload (chemins pointés), champ ou chemin absent
 -> '[absent]'. La syntaxe est validée au chargement de la config ; le rendu
 lui-même est total : aucune erreur de rendu ne peut atteindre la boucle.
+Limite connue : une clé contenant un point n'est pas adressable ('{a.b}' est
+une syntaxe de chemin, jamais une clé littérale).
 """
 
 from __future__ import annotations
@@ -52,6 +54,8 @@ def _tokenize(template: str) -> list[tuple[str, str]]:
             raise TemplateError("placeholder avec espace interdit")
         if "{" in field:
             raise TemplateError("'{' interdit dans un placeholder")
+        if any(not segment for segment in field.split(".")):
+            raise TemplateError("segment de chemin vide")
         if text:
             tokens.append(("text", "".join(text)))
             text = []
