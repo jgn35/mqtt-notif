@@ -484,3 +484,20 @@ def test_rule_debounce_ms_non_integer_rejected(tmp_path, value):
     message = str(excinfo.value)
     assert "salon" in message
     assert "0-3600000" in message
+
+
+def test_rule_debounce_error_precedes_template_error(tmp_path):
+    """Précédence de validation épinglée : debounce_ms hors bornes et gabarit
+    invalide dans la même règle -> l'erreur debounce_ms gagne (validée avant
+    les gabarits), l'erreur de gabarit n'est jamais atteinte."""
+    content = (
+        BROKER_YAML
+        + 'rules:\n  - name: salon\n    topic: "home/x"\n    debounce_ms: -1\n'
+        + "    title: 'Alerte { champ}'\n    short_message: M\n"
+    )
+    with pytest.raises(ConfigError, match="'debounce_ms'") as excinfo:
+        load_config(str(write_yaml(tmp_path, content)))
+    message = str(excinfo.value)
+    assert "salon" in message
+    assert "0-3600000" in message
+    assert "placeholder avec espace" not in message

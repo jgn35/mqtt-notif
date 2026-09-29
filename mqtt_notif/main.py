@@ -6,8 +6,10 @@ dans l'événement, jamais relue) ; le store et sa tâche de surveillance du
 YAML (sondage mtime, rechargement à chaud) sont créés à l'assemblage et
 le watcher est arrêté proprement au SIGTERM/SIGINT. Le debounce optionnel
 par règle (fenêtre ancrée à la réception du message, jamais à l'envoi)
-s'insère entre le rendu et l'émetteur : l'émetteur n'est appelé que si la
-fenêtre l'autorise, le message ignoré est journalisé en debug.
+précède l'émetteur : le rendu et l'envoi FCM ne s'exécutent que si la
+fenêtre l'autorise — un message silencié n'est jamais rendu ; le message
+ignoré est journalisé avec le préfixe « debug: » (log_line n'a pas de
+niveaux, le préfixe fait office), avec la fenêtre restante.
 
 Tâche d'envoi asyncio indépendante par message (la boucle n'attend jamais la
 fin d'un envoi). SIGTERM/SIGINT -> arrêt propre, exit code 0. Erreurs fatales
@@ -95,15 +97,18 @@ def build_event(rules: tuple[Rule, ...], topic: str, payload: str) -> Event | No
 async def _dispatch(
     notifier: Notifier, debouncer: Debouncer, event: Event, received_at: float
 ) -> None:
-    """Étape émetteur : le debounce décide si l'émetteur est appelé (fenêtre
-    ancrée à la réception du message, jamais à l'envoi) ; le rendu et l'envoi
-    FCM s'exécutent ici, dans cette tâche (hors boucle d'écoute) — aucune
-    erreur de rendu ne remonte au pipeline. Un message silencié est perdu
-    (QoS 0, aucun rejeu) et journalisé en debug."""
+    """Étape émetteur : le filtre de debounce décide en premier (fenêtre
+    ancrée à la réception du message, jamais à l'envoi, jamais au succès
+    de l'envoi) ; le rendu puis l'envoi FCM ne s'exécutent ici, dans cette
+    tâche (hors boucle d'écoute), que si la fenêtre l'autorise — un message
+    silencié n'est jamais rendu. Il est perdu (QoS 0, aucun rejeu) et
+    journalisé avec le préfixe « debug: » et la fenêtre restante ; aucune
+    erreur de rendu ne remonte au pipeline."""
     if not debouncer.should_notify(event.rule, received_at):
+        remaining_ms = debouncer.remaining_ms(event.rule, received_at)
         log_line(
-            f"message ignored topic={event.topic} rule={event.rule.name} "
-            f"debounce_ms={event.rule.debounce_ms} (fenêtre active)"
+            f"debug: message ignored topic={event.topic} rule={event.rule.name} "
+            f"debounce_ms={event.rule.debounce_ms} fenêtre restante={remaining_ms:.0f} ms"
         )
         return
     await notifier.notify(event)

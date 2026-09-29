@@ -57,7 +57,7 @@ async def _resync_subscriptions(
 
 
 async def iter_messages(
-    store: ConfigStore, stop: asyncio.Event, debouncer: Debouncer | None = None
+    store: ConfigStore, stop: asyncio.Event, debouncer: Debouncer
 ) -> AsyncIterator[aiomqtt.Message]:
     """Itère les messages des topics souscrits ; reconnexion auto à backoff croissant.
 
@@ -108,8 +108,7 @@ async def iter_messages(
                             # celles des règles restées) au moment du changed.
                             store.changed.clear()
                             rules = store.get().rules
-                            if debouncer is not None:
-                                debouncer.purge({rule.name for rule in rules})
+                            debouncer.purge({rule.name for rule in rules})
                             topics = subscription_topics(rules)
                             await _resync_subscriptions(client, current, topics)
                             current = set(topics)

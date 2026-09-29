@@ -6,7 +6,6 @@ déconnexion, rotation du device token, lecteur unique du YAML (grep)."""
 from __future__ import annotations
 
 import asyncio
-import itertools
 import os
 import re
 import signal
@@ -15,31 +14,23 @@ from pathlib import Path
 
 import aiomqtt
 import pytest
-import yaml
 
 import mqtt_notif
 import mqtt_notif.config as config_module
 import mqtt_notif.mqtt as mqtt_module
 from mqtt_notif.config import Config, ConfigError, ConfigStore, load_config
+from mqtt_notif.debounce import Debouncer
 from mqtt_notif.main import Event, build_event, run_pipeline, serve
 from mqtt_notif.mqtt import iter_messages, message_payload
 from mqtt_notif.notifier import Notifier
 from mqtt_notif.render import render_message
 from mqtt_notif.rules import Rule
 
-from .conftest import Episode, FakeMessage
+from .conftest import Episode, FakeMessage, bump_mtime, write_config_yaml
 
 ISO_UTC = re.compile(r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?\+00:00\] ")
 
 DEFAULT_RULES = (("salon", "home/salon/capteur", "Capteur salon", "Valeur: {valeur}"),)
-
-_MTIME_NS = itertools.count(1)
-
-
-def bump_mtime(path: Path) -> None:
-    """mtimes strictement croissants et déterministes (indépendants du FS)."""
-    ns = next(_MTIME_NS) * 1_000_000
-    os.utime(path, ns=(ns, ns))
 
 
 def write_yaml(
@@ -50,20 +41,19 @@ def write_yaml(
     token: str = "token-a",
     rules=DEFAULT_RULES,
 ) -> Path:
-    """Écrit un YAML valide (règles : name, topic, title, short_message),
-    échappement garanti par safe_dump (une valeur avec guillemet reste du
-    YAML valide), et bombe le mtime : le sondage du store verra le changement."""
-    data = {
-        "broker": {"host": host, "port": port},
-        "device_token": token,
-        "rules": [
+    """Écrit un YAML valide (règles : name, topic, title, short_message) via
+    la copie unique de conftest (échappement safe_dump, mtime bombé pour le
+    sondage du store)."""
+    return write_config_yaml(
+        path,
+        [
             {"name": name, "topic": topic, "title": title, "short_message": short_message}
             for name, topic, title, short_message in rules
         ],
-    }
-    path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
-    bump_mtime(path)
-    return path
+        host=host,
+        port=port,
+        token=token,
+    )
 
 
 def file_store(path: Path) -> ConfigStore:
@@ -482,7 +472,7 @@ async def test_resync_subscriptions_without_disconnection(fake_broker, tmp_path,
     episodes.append(episode)
     stop = asyncio.Event()
 
-    it = iter_messages(store, stop)
+    it = iter_messages(store, stop, Debouncer())
     first = await asyncio.wait_for(anext(it), timeout=5)
     assert str(first.topic) == "home/cave/temp"  # encore abonné avant le swap
     assert sorted(clients[0].subscribed) == [
@@ -534,7 +524,7 @@ async def test_resync_without_topic_change_is_silent(fake_broker, tmp_path, caps
     episodes.append(episode)
     stop = asyncio.Event()
 
-    it = iter_messages(store, stop)
+    it = iter_messages(store, stop, Debouncer())
     await asyncio.wait_for(anext(it), timeout=5)
 
     write_yaml(path, rules=(("salon", "home/salon/capteur", "Capteur salon v2", "V2: {valeur}"),))
@@ -573,7 +563,7 @@ async def test_next_event_uses_reloaded_label(fake_broker, tmp_path):
     )
     stop = asyncio.Event()
 
-    it = iter_messages(store, stop)
+    it = iter_messages(store, stop, Debouncer())
     first = await asyncio.wait_for(anext(it), timeout=5)
     event1 = build_event(store.get().rules, str(first.topic), message_payload(first))
 

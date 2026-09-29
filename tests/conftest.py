@@ -1,18 +1,43 @@
-"""Fixtures partagées : faux broker MQTT (aiomqtt mocké) et configuration de test."""
+"""Fixtures partagées : faux broker MQTT (aiomqtt mocké), configuration de test
+et écriture de YAML de test (mtime bombé pour le sondage du store)."""
 
 from __future__ import annotations
 
 import asyncio
+import itertools
+import os
 import threading
+from pathlib import Path
 
 import aiomqtt
 import firebase_admin
 import pytest
+import yaml
 from firebase_admin import messaging
 
 from mqtt_notif.config import Config
 from mqtt_notif.notifier import CREDENTIALS_ENV
 from mqtt_notif.rules import Rule, topic_matches
+
+_MTIME_NS = itertools.count(1)
+
+
+def bump_mtime(path) -> None:
+    """mtimes strictement croissants et déterministes (indépendants du FS)."""
+    ns = next(_MTIME_NS) * 1_000_000
+    os.utime(path, ns=(ns, ns))
+
+
+def write_config_yaml(
+    path, rules, *, host: str = "localhost", port: int = 1883, token: str = "token-a"
+) -> Path:
+    """Écrit un YAML valide ; `rules` = liste d'entrées de règle (dicts),
+    échappement garanti par safe_dump ; bombe le mtime : le sondage du store
+    verra le changement. Copie unique de la mécanique d'écriture."""
+    data = {"broker": {"host": host, "port": port}, "device_token": token, "rules": rules}
+    path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+    bump_mtime(path)
+    return path
 
 
 class FakeMessage:
