@@ -2,7 +2,7 @@
 title: 'Story 2.1 — Rechargement à chaud avec swap atomique'
 type: 'feature'
 created: '2026-09-28'
-status: 'in-progress'
+status: 'done'
 route: 'dispatch'
 review_loop_iteration: 0
 baseline_commit: db294c4
@@ -61,11 +61,11 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `mqtt_notif/config.py` -- ConfigStore : sondage mtime, validation avant swap, swap atomique, journal -- AC-2.1.1, AC-2.1.2, AC-2.1.3, AC-2.1.5.
-- [ ] `mqtt_notif/mqtt.py` -- resynchronisation des souscriptions au swap (delta abonner/désabonner, sans déconnexion) -- AC-2.1.4.
-- [ ] `mqtt_notif/notifier.py` -- token lu au moment de l'envoi depuis le snapshot du store -- AC-2.1.7.
-- [ ] `mqtt_notif/main.py` -- assemblage : store + watcher, sélection depuis `store.get()`, arrêt propre du watcher.
-- [ ] `tests/` -- couvrir la matrice I/O, dont un test de lecteur unique (échoue si un autre module lit le YAML) -- AC-2.1.6 et chaque AC.
+- [x] `mqtt_notif/config.py` -- ConfigStore : sondage mtime, validation avant swap, swap atomique, journal -- AC-2.1.1, AC-2.1.2, AC-2.1.3, AC-2.1.5.
+- [x] `mqtt_notif/mqtt.py` -- resynchronisation des souscriptions au swap (delta abonner/désabonner, sans déconnexion) -- AC-2.1.4.
+- [x] `mqtt_notif/notifier.py` -- token lu au moment de l'envoi depuis le snapshot du store -- AC-2.1.7.
+- [x] `mqtt_notif/main.py` -- assemblage : store + watcher, sélection depuis `store.get()`, arrêt propre du watcher.
+- [x] `tests/` -- couvrir la matrice I/O, dont un test de lecteur unique (échoue si un autre module lit le YAML) -- AC-2.1.6 et chaque AC.
 
 **Acceptance Criteria:**
 - Given le démon en marche et un libellé modifié, when l'événement suivant arrive, then il utilise le nouveau libellé sans redémarrage.
@@ -82,6 +82,24 @@ Décisions internes (non perceptibles pour l'utilisateur) :
 - Le rendu et la sélection restent sur l'événement figé ; seul le token (hors de l'événement, AD-10) et les futures règles (événements suivants) suivent le store.
 - Interval de sondage : constante de l'ordre de la seconde (le « prochain événement » masque la latence du sondage ; la précision n'a pas d'exigence).
 - Changement host/port : comparaison avec la config courante au rechargement → rejet explicite plutôt que swap silencieux inopérant.
+
+## Review Triage Log
+
+- `config.py:poll` + `main.py:serve` — une exception non-ConfigError (ex. RecursionError YAML) s'échappe de poll(), tue le watcher, avalée par gather sans log : rechargement à chaud mort en silence — high — réel, vérifié (claim falsifié empiriquement) — patch (containment large dans poll + log de la mort du watcher dans serve).
+- `config.py:__init__` — `os.stat` non gardé : fichier disparu entre load_config et stat → OSError brut, traceback au démarrage au lieu de l'échec rapide propre — medium — réel (fenêtre minuscule mais contrat cassé) — patch.
+- `config.py:poll` — fichier définitivement supprimé : silence total, aucune ligne de journal, incohérent avec « une ligne par rechargement » — medium — réel — patch (log sur transition vers absent).
+- `config.py:poll` — rejet host/port bloque silencieusement tous les rechargements suivants (rotation du token incluse) tant que le fichier n'est pas réverté — medium — réel, conséquence du tout-ou-rien — patch (message explicite + test de récupération après réversion).
+- `config.py:poll` — TOCTOU stat/load : remplacement du fichier pendant le chargement peut figer une config périmée comme baseline — low — réel mais fenêtre microscopique (éditeurs = rename atomique) — patch (re-stat après chargement, re-poll immédiat si différent).
+- `config.py:poll` — réécriture à mtime identique jamais détectée — low — réel seulement sur FS à granularité grossière (la cible ext4 est en ns) — patch (suivi mtime + taille).
+- `tests/` — aucun test pipeline (run_pipeline/serve) ne vérifie l'effet à l'événement suivant après rechargement : mutation « rules hoistées hors de la boucle » reste verte — medium — réel, prouvé par mutation — patch (test e2e).
+- `tests/` — aucun rechargement testé pendant une déconnexion/backoff (nouvelle connexion doit souscrire le nouvel ensemble ; drapeau changed périmé consommé) — medium — réel — patch (test).
+- `tests/test_hot_reload.py` — test « lecteur unique » par regex naïve (mention yaml en commentaire ferait échouer, read_text non détecté) — low — réel — patch (motifs d'import).
+- `tests/` — fixture `fcm_mock` dupliquée avec des formes différentes entre test_notifier.py et test_hot_reload.py — low — réel (piège de maintenance) — patch (harmonisation).
+- `tests/` — borne d'assertion 4 s sans rapport avec l'intervalle patché à 0.01 s ; helper write_yaml sans échappement ; boucle 30 itérations du smoke test d'atomicité (bruit) — low — réel — patch (nettoyage des trois).
+- `mqtt.py:iter_messages` — churn de tâches par message (deux tâches créées/annulées par message) — low — volume domestique faible, la structure FIRST_COMPLETED est la garantie d'atomicité — rejet.
+- `asyncio.Event` créé hors boucle dans ConfigStore.__init__ — false sur la cible — Python 3.13 épinglé (requires-python >=3.13), liaison paresseuse garantie — rejet.
+- `load_config_from_env` mort en production (seuls les tests l'utilisent) — low — réel — patch (suppression, tests mis à jour).
+- `Message.token` déprécié — false — décision AD-6, déjà triée deux fois — rejet.
 
 ## Verification
 
