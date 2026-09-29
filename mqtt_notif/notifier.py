@@ -3,15 +3,15 @@
 Seul module qui construit et envoie des messages FCM : notify(event) rend
 les gabarits de la règle figée dans l'événement (title, short_message,
 detailed_message seulement si la règle le définit), valide le contrat de
-l'app mcp-notif (champs non vides, tailles en octets UTF-8 bornées),
-tronque à la frontière de caractère puis envoie le message data-only.
-Erreurs sans retry (unregistered, invalid_argument, permission_denied et
-toute erreur non mappée — conservateur) : journalisées, aucun retry.
-Erreurs avec retry (throttled, internal, network_error) : retries à
-backoff borné puis abandon journalisé. Initialisation firebase-admin
-paresseuse depuis MQTT_NOTIF_FIREBASE_CREDENTIALS ; aucune erreur (rendu
-compris) n'arrête jamais le service, chaque envoi reste une tâche
-asyncio indépendante.
+l'app mcp-notif (champs non vides, tailles en octets UTF-8 bornées, charge
+utile totale sous la limite FCM), tronque à la frontière de caractère
+puis envoie le message data-only. Erreurs sans retry (unregistered,
+invalid_argument, permission_denied et toute erreur non mappée —
+conservateur) : journalisées, aucun retry. Erreurs avec retry (throttled,
+internal, network_error — envoi bloqué compris) : retries à backoff borné
+puis abandon journalisé. Initialisation firebase-admin paresseuse depuis
+MQTT_NOTIF_FIREBASE_CREDENTIALS ; aucune erreur (rendu compris) n'arrête
+jamais le service, chaque envoi reste une tâche asyncio indépendante.
 """
 
 from __future__ import annotations
@@ -43,8 +43,18 @@ CONTRACT_MAX_BYTES = {
     "detailed_message": DETAILED_MESSAGE_MAX_BYTES,
 }
 
+# Limite totale de la charge utile data d'un message FCM (4 KiB) : les
+# plafonds par champ totalisent 4100 octets, detailed_message sert de soupape.
+FCM_DATA_MAX_BYTES = 4096
+
 # Backoff borné : une tentative initiale puis un retry par délai, jamais plus.
-RETRY_BACKOFF_DELAYS_S = (1.0, 2.0, 4.0)
+# La somme (3.5s) reste sous SHUTDOWN_TIMEOUT_S de main.py (5.0s) : le drain
+# d'arrêt n'attend jamais plus qu'un cycle de retries complet.
+RETRY_BACKOFF_DELAYS_S = (0.5, 1.0, 2.0)
+
+# Un appel FCM qui ne répond pas occupe sa tâche au plus SEND_TIMEOUT_S
+# (le thread sous-jacent, lui, ne peut pas être interrompu).
+SEND_TIMEOUT_S = 30.0
 
 # Erreurs FCM sans retry : le réessayer ne peut pas réussir.
 NO_RETRY_ERRORS = (
@@ -56,8 +66,11 @@ NO_RETRY_ERRORS = (
 RETRYABLE_ERRORS = (
     (messaging.QuotaExceededError, "throttled"),
     (exceptions.InternalError, "internal"),
+    (exceptions.UnavailableError, "network_error"),
+    (exceptions.DeadlineExceededError, "network_error"),
     (ConnectionError, "network_error"),
     (requests.exceptions.RequestException, "network_error"),
+    (TimeoutError, "network_error"),  # SEND_TIMEOUT_S expiré : envoi bloqué
 )
 
 
@@ -95,8 +108,9 @@ class Notifier:
         """Rend le message depuis l'événement, valide le contrat puis envoie.
 
         Ne lève jamais : rendu cassé, champ vide, hors limites, identifiants
-        absents, token refusé, échec réseau — tout est journalisé avec topic
-        et règle pour retracer la notification fautive, le service continue.
+        absents, token refusé, échec réseau, envoi bloqué — tout est journalisé
+        avec topic et règle pour retracer la notification fautive, le service
+        continue.
         """
         try:
             data = render_message(event.rule, event.payload)
@@ -106,23 +120,78 @@ class Notifier:
                 f"topic={event.topic} rule={event.rule.name}"
             )
             return
-        empty_fields = [
-            key for key in ("title", "short_message") if not data.get(key, "").strip()
-        ]
+        try:
+            contract = self._apply_contract(data, event)
+        except Exception as exc:  # noqa: BLE001 — le contrat ne lève jamais hors de ce try
+            log_line(
+                f"contract failed error={type(exc).__name__}: {exc} "
+                f"topic={event.topic} rule={event.rule.name}"
+            )
+            return
+        if contract is None:
+            return
+        await self._send_with_retries(contract, event)
+
+    def _apply_contract(self, data: dict[str, object], event: "Event") -> dict[str, str] | None:
+        """Applique le contrat mcp-notif au rendu brut, défensivement.
+
+        Ne se fie pas au rendu : clés du contrat uniquement, valeurs coercées
+        en str, champ requis vide (ou blanc) -> envoi refusé (None), clé
+        detailed_message vide omise (clé non envoyée), troncature par champ
+        à la frontière de caractère (journalisée), garde totale : la charge
+        utile entière tient dans FCM_DATA_MAX_BYTES, detailed_message sert
+        de soupape. Chaque troncature réelle est journalisée — jamais de
+        perte de contenu silencieuse.
+        """
+        cleaned: dict[str, str] = {}
+        empty_fields: list[str] = []
+        for key, limit in CONTRACT_MAX_BYTES.items():
+            if key not in data:
+                continue
+            text = data[key]
+            if not isinstance(text, str):
+                text = str(text)
+            if not text.strip():
+                if key == "detailed_message":
+                    continue  # clé optionnelle : vide -> non envoyée
+                empty_fields.append(key)
+                continue
+            cleaned[key] = text
         if empty_fields:
             log_line(
                 f"fcm send refused: {', '.join(empty_fields)} vide après rendu, "
                 f"notification ignorée topic={event.topic} rule={event.rule.name}"
             )
-            return
-        data = {
-            key: _truncate_utf8(value, CONTRACT_MAX_BYTES[key]) for key, value in data.items()
-        }
-        await self._send_with_retries(data, event)
+            return None
+        result: dict[str, str] = {}
+        for key, text in cleaned.items():
+            truncated = _truncate_utf8(text, CONTRACT_MAX_BYTES[key])
+            if truncated != text:
+                log_line(
+                    f"fcm contract truncated: {key} "
+                    f"{len(text.encode('utf-8'))} -> {len(truncated.encode('utf-8'))} octets "
+                    f"topic={event.topic} rule={event.rule.name}"
+                )
+            result[key] = truncated
+        total = sum(len(value.encode("utf-8")) for value in result.values())
+        overflow = total - FCM_DATA_MAX_BYTES
+        if overflow > 0 and "detailed_message" in result:
+            before = len(result["detailed_message"].encode("utf-8"))
+            trimmed = _truncate_utf8(result["detailed_message"], max(0, before - overflow))
+            log_line(
+                f"fcm contract truncated: detailed_message {before} -> "
+                f"{len(trimmed.encode('utf-8'))} octets (limite totale {FCM_DATA_MAX_BYTES}) "
+                f"topic={event.topic} rule={event.rule.name}"
+            )
+            if not trimmed:
+                del result["detailed_message"]
+            else:
+                result["detailed_message"] = trimmed
+        return result
 
     async def _send_with_retries(self, data: dict[str, str], event: "Event") -> None:
-        """Envoie via to_thread ; retries à backoff borné sur les erreurs
-        retryables uniquement, puis abandon journalisé.
+        """Envoie via to_thread (borné par SEND_TIMEOUT_S) ; retries à backoff
+        borné sur les erreurs retryables uniquement, puis abandon journalisé.
 
         Le backoff s'applique au seul appel FCM (jamais au rendu) et ne
         bloque jamais la boucle : il dort dans cette tâche indépendante.
@@ -131,7 +200,9 @@ class Notifier:
         attempts = len(delays) + 1
         for attempt in range(attempts):
             try:
-                await asyncio.to_thread(self._send, data)
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._send, data), timeout=SEND_TIMEOUT_S
+                )
                 log_line(f"fcm sent topic={event.topic}")
                 return
             except Exception as exc:  # noqa: BLE001 — erreurs d'envoi jamais fatales

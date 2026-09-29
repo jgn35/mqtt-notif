@@ -17,12 +17,14 @@ import requests
 from firebase_admin import exceptions, messaging
 
 import mqtt_notif
-from mqtt_notif.main import Event
+from mqtt_notif.main import Event, SHUTDOWN_TIMEOUT_S
 from mqtt_notif.notifier import (
     CONTRACT_MAX_BYTES,
     CREDENTIALS_ENV,
     DETAILED_MESSAGE_MAX_BYTES,
+    NO_RETRY_ERRORS,
     Notifier,
+    RETRYABLE_ERRORS,
     RETRY_BACKOFF_DELAYS_S,
     SHORT_MESSAGE_MAX_BYTES,
     TITLE_MAX_BYTES,
@@ -275,9 +277,20 @@ EXACT_LIMITS_RULE = Rule(
     topic="home/limites",
     title="é" * 50,  # 100 octets exactement
     short_message="è" * 250,  # 500 octets exactement
-    detailed_message="ê" * 1750,  # 3500 octets exactement
+    # 3400 octets : à son plafond (3500) le total déborderait la garde
+    # totale FCM (100 + 500 + 3500 > 4096), voir TOTAL_OVERFLOW_RULE.
+    detailed_message="ê" * 1700,
 )
 EXACT_LIMITS_EVENT = Event(topic="home/limites", payload={}, rule=EXACT_LIMITS_RULE)
+# Les trois champs à leurs plafonds : 100 + 500 + 3500 = 4100 > 4096.
+TOTAL_OVERFLOW_RULE = Rule(
+    name="deborde-total",
+    topic="home/deborde",
+    title="é" * 50,
+    short_message="è" * 250,
+    detailed_message="ê" * 1750,
+)
+TOTAL_OVERFLOW_EVENT = Event(topic="home/deborde", payload={}, rule=TOTAL_OVERFLOW_RULE)
 EMPTY_TITLE_RULE = Rule(name="titre-vide", topic="home/vide", title="", short_message="msg")
 EMPTY_TITLE_EVENT = Event(topic="home/vide", payload={}, rule=EMPTY_TITLE_RULE)
 EMPTY_SHORT_RULE = Rule(name="court-vide", topic="home/vide2", title="Titre", short_message="")
@@ -328,8 +341,9 @@ async def test_short_and_detailed_messages_truncated_to_limits(fcm_mock):
 
 
 async def test_fields_at_exact_limits_sent_untouched(fcm_mock):
-    """AC-1.4.1 : valeurs exactement aux limites (100/500/3500 octets) ->
-    rien n'est tronqué, le message part byte-identique au rendu."""
+    """AC-1.4.1 : valeurs exactement aux limites par champ (100/500 octets)
+    et total sous la garde FCM -> rien n'est tronqué, le message part
+    byte-identique au rendu."""
     calls, _threads = fcm_mock
     notifier = Notifier("token-abc")
     await notifier.notify(EXACT_LIMITS_EVENT)
@@ -338,11 +352,11 @@ async def test_fields_at_exact_limits_sent_untouched(fcm_mock):
     assert data == {
         "title": "é" * 50,
         "short_message": "è" * 250,
-        "detailed_message": "ê" * 1750,
+        "detailed_message": "ê" * 1700,
     }
     assert len(data["title"].encode("utf-8")) == TITLE_MAX_BYTES
     assert len(data["short_message"].encode("utf-8")) == SHORT_MESSAGE_MAX_BYTES
-    assert len(data["detailed_message"].encode("utf-8")) == DETAILED_MESSAGE_MAX_BYTES
+    assert len(data["detailed_message"].encode("utf-8")) <= DETAILED_MESSAGE_MAX_BYTES
 
 
 @pytest.mark.parametrize(
@@ -410,15 +424,36 @@ async def test_no_retry_error_logged_once_no_retry(fcm_mock, monkeypatch, capsys
     assert len(calls) == 1
 
 
+def test_retry_backoff_is_bounded_by_constants():
+    """NFR : le nombre de retries et les délais de backoff sont bornés par
+    des constantes — jamais de retry illimité ni de délai non borné. La somme
+    du cycle complet reste sous le budget de drain d'arrêt de main.py."""
+    assert isinstance(RETRY_BACKOFF_DELAYS_S, tuple)
+    assert 1 <= len(RETRY_BACKOFF_DELAYS_S) <= 5
+    assert all(0 < delay <= 10.0 for delay in RETRY_BACKOFF_DELAYS_S)
+    assert sum(RETRY_BACKOFF_DELAYS_S) < SHUTDOWN_TIMEOUT_S
+
+
+def test_retry_policy_classes_are_disjoint():
+    """Invariant de la politique : aucune classe d'exception ne relève des
+    deux tables — la classification par isinstance reste déterministe,
+    quel que soit l'ordre de parcours des politiques."""
+    no_retry = {exc_type for exc_type, _label in NO_RETRY_ERRORS}
+    retryable = {exc_type for exc_type, _label in RETRYABLE_ERRORS}
+    assert no_retry & retryable == set()
+
+
 @pytest.mark.parametrize(
     ("error_factory", "label"),
     [
         (lambda: messaging.QuotaExceededError("ralenti"), "throttled"),
         (lambda: exceptions.InternalError("panne passagère"), "internal"),
+        (lambda: exceptions.UnavailableError("indisponible"), "network_error"),
+        (lambda: exceptions.DeadlineExceededError("délai dépassé"), "network_error"),
         (lambda: ConnectionError("réseau coupé"), "network_error"),
         (lambda: requests.exceptions.ConnectionError("dns cassé"), "network_error"),
     ],
-    ids=["throttled", "internal", "network-error", "requests-network-error"],
+    ids=["throttled", "internal", "unavailable", "deadline-exceeded", "network-error", "requests-network-error"],
 )
 async def test_retryable_error_retried_with_backoff_then_abandoned(
     fcm_mock, monkeypatch, capsys, error_factory, label
@@ -496,14 +531,6 @@ async def test_unmapped_error_is_conservative_no_retry(fcm_mock, monkeypatch, ca
     assert "fcm send retry" not in out
 
 
-def test_retry_backoff_is_bounded_by_constants():
-    """NFR : le nombre de retries et les délais de backoff sont bornés par
-    des constantes — jamais de retry illimité ni de délai non borné."""
-    assert isinstance(RETRY_BACKOFF_DELAYS_S, tuple)
-    assert 1 <= len(RETRY_BACKOFF_DELAYS_S) <= 5
-    assert all(0 < delay <= 10.0 for delay in RETRY_BACKOFF_DELAYS_S)
-
-
 async def test_mixed_error_burst_never_crashes_and_service_continues(
     fcm_mock, monkeypatch, capsys
 ):
@@ -555,30 +582,156 @@ SLOW_FAIL_EVENT = Event(topic="home/lent", payload={}, rule=SLOW_FAIL_RULE)
 async def test_slow_failing_send_does_not_block_following_sends(fcm_mock, monkeypatch, capsys):
     """AC-1.4.7 (matrice) : envoi lent puis en erreur (avec retries) ->
     l'envoi suivant aboutit pendant que le lent traîne, chaque envoi
-    reste une tâche indépendante, la boucle ne bloque jamais."""
+    reste une tâche indépendante, la boucle ne bloque jamais.
+    Synchronisation déterministe : le faux FCM bloque jusqu'à libération."""
     calls, _threads = fcm_mock
     monkeypatch.setattr("mqtt_notif.notifier.RETRY_BACKOFF_DELAYS_S", (0.0, 0.0, 0.0))
+    slow_started = threading.Event()
+    slow_release = threading.Event()
 
     def fake_send(message, **kwargs):
         if message.data["title"] == "Lent":
-            time.sleep(0.2)  # mock FCM qui traîne
+            slow_started.set()
+            slow_release.wait(5)  # mock FCM qui traîne, borné par sécurité
             raise messaging.QuotaExceededError("ralenti")
         calls.append(message)
 
     monkeypatch.setattr(messaging, "send", fake_send)
     notifier = Notifier("token-abc")
     slow_task = asyncio.create_task(notifier.notify(SLOW_FAIL_EVENT))
-    await asyncio.sleep(0.02)  # le lent est en cours dans to_thread
+    await asyncio.to_thread(slow_started.wait)  # le lent est bien en cours dans to_thread
 
     # L'envoi suivant aboutit pendant que le lent traîne encore.
-    await asyncio.wait_for(notifier.notify(MINIMAL_EVENT), timeout=0.1)
+    await asyncio.wait_for(notifier.notify(MINIMAL_EVENT), timeout=1.0)
     assert not slow_task.done()
     assert calls[0].data["title"] == "Température"
 
+    slow_release.set()
     await asyncio.wait_for(slow_task, timeout=5)
     out = capsys.readouterr().out
     assert "fcm sent" in out
     assert "fcm send failed: throttled abandon après 4 tentatives" in out
+
+
+async def test_backoff_delays_actually_slept_in_order(fcm_mock, monkeypatch, capsys):
+    """Les délais réels du backoff (0.5, 1.0, 2.0) sont dormis, dans l'ordre,
+    sur un cycle complet d'abandon — pas seulement déclarés."""
+    calls, _threads = fcm_mock
+    real_sleep = asyncio.sleep
+    slept: list[float] = []
+
+    async def recording_sleep(delay, *args, **kwargs):
+        slept.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", recording_sleep)
+
+    def fake_send(message, **kwargs):
+        raise messaging.QuotaExceededError("ralenti")
+
+    monkeypatch.setattr(messaging, "send", fake_send)
+    notifier = Notifier("token-abc")
+    await asyncio.wait_for(notifier.notify(MINIMAL_EVENT), timeout=5)
+
+    assert slept == [0.5, 1.0, 2.0]
+    out = capsys.readouterr().out
+    assert "fcm send failed: throttled abandon après 4 tentatives" in out
+
+
+async def test_hung_send_bounded_by_send_timeout(fcm_mock, monkeypatch, capsys):
+    """Envoi FCM qui ne répond jamais : chaque tentative est bornée par
+    SEND_TIMEOUT_S (TimeoutError -> network_error, retryable), le cycle
+    entier reste borné malgré le hang."""
+    calls, _threads = fcm_mock
+    monkeypatch.setattr("mqtt_notif.notifier.SEND_TIMEOUT_S", 0.05)
+    monkeypatch.setattr("mqtt_notif.notifier.RETRY_BACKOFF_DELAYS_S", (0.0, 0.0, 0.0))
+    attempts = []
+
+    def fake_send(message, **kwargs):
+        attempts.append(1)
+        time.sleep(1.0)  # HTTP qui ne revient jamais
+
+    monkeypatch.setattr(messaging, "send", fake_send)
+    notifier = Notifier("token-abc")
+    start = time.monotonic()
+    await asyncio.wait_for(notifier.notify(MINIMAL_EVENT), timeout=5)
+
+    assert len(attempts) == 4  # borné : le hang ne consomme qu'un cycle
+    assert time.monotonic() - start < 2.0
+    out = capsys.readouterr().out
+    assert "fcm send retry: network_error" in out
+    assert "fcm send failed: network_error abandon après 4 tentatives" in out
+    assert calls == []
+
+
+async def test_truncation_is_logged_with_field_topic_and_rule(fcm_mock, capsys):
+    """AC-1.4.1 : jamais de perte de contenu silencieuse — chaque troncature
+    réelle journalise le champ coupé, avec topic et règle."""
+    calls, _threads = fcm_mock
+    notifier = Notifier("token-abc")
+    await notifier.notify(LONG_TITLE_EVENT)
+
+    out = capsys.readouterr().out
+    assert "fcm contract truncated: title 120 -> 100 octets" in out
+    assert "topic=home/long/titre" in out
+    assert "rule=titre-long" in out
+    assert calls[0].data["title"] == "é" * 50
+
+
+async def test_total_payload_kept_under_fcm_limit_via_detailed_valve(fcm_mock, capsys):
+    """Les trois champs à leurs plafonds totalisent 4100 octets > limite FCM
+    (4096) : la garde totale trimé detailed_message (soupape) à la frontière
+    de caractère, les autres champs restent à leurs plafonds."""
+    calls, _threads = fcm_mock
+    notifier = Notifier("token-abc")
+    await notifier.notify(TOTAL_OVERFLOW_EVENT)
+
+    data = calls[0].data
+    assert data["title"] == "é" * 50
+    assert data["short_message"] == "è" * 250
+    assert data["detailed_message"] == "ê" * 1748  # 3496 octets : 3500 - 4 de débordement
+    assert sum(len(value.encode("utf-8")) for value in data.values()) <= 4096
+    out = capsys.readouterr().out
+    assert "fcm contract truncated: detailed_message 3500 -> 3496 octets (limite totale 4096)" in out
+
+
+@pytest.mark.parametrize("detailed", ["", "   "], ids=["vide", "blanc"])
+async def test_empty_detailed_message_key_not_sent(fcm_mock, detailed):
+    """AC-1.3.9 : detailed_message vide (ou blanc) après rendu -> clé non
+    envoyée, comme une règle qui ne le définit pas."""
+    calls, _threads = fcm_mock
+    rule = Rule(
+        name="detail-vide",
+        topic="home/detail",
+        title="T",
+        short_message="s",
+        detailed_message=detailed,
+    )
+    event = Event(topic="home/detail", payload={}, rule=rule)
+    notifier = Notifier("token-abc")
+    await notifier.notify(event)
+
+    assert calls[0].data == {"title": "T", "short_message": "s"}
+
+
+async def test_contract_defensive_against_unexpected_render_output(fcm_mock, monkeypatch):
+    """Le bloc validation/truncation ne lève jamais : clé inconnue ignorée,
+    valeur non-string coercée, clé detailed_message vide omise — aucun échec
+    ne fuit hors de notify()."""
+    calls, _threads = fcm_mock
+    monkeypatch.setattr(
+        "mqtt_notif.notifier.render_message",
+        lambda rule, payload: {
+            "title": "Titre",
+            "short_message": 21,  # non-string : coercé, pas d'AttributeError
+            "detailed_message": "   ",  # vide : clé omise
+            "hors_contrat": "x",  # clé inconnue : ignorée
+        },
+    )
+    notifier = Notifier("token-abc")
+    await notifier.notify(MINIMAL_EVENT)  # ne lève jamais
+
+    assert calls[0].data == {"title": "Titre", "short_message": "21"}
 
 
 def test_only_notifier_module_references_firebase():

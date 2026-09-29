@@ -16,12 +16,15 @@ import textwrap
 import time
 
 import aiomqtt
+import firebase_admin
 import pytest
+from firebase_admin import messaging
 
 import mqtt_notif.main as main_module
 import mqtt_notif.mqtt as mqtt_module
 from mqtt_notif.config import Config
 from mqtt_notif.main import build_event, main, run_pipeline, serve
+from mqtt_notif.notifier import CREDENTIALS_ENV, Notifier
 from mqtt_notif.render import MISSING, render_message
 from mqtt_notif.rules import PAYLOAD_FORMAT_RAW, Rule
 
@@ -544,6 +547,48 @@ async def test_shutdown_drain_is_bounded(config, monkeypatch, capsys):
     assert notifier.calls == 1
     out = capsys.readouterr().out
     assert "fcm sends abandoned" in out
+
+
+async def test_shutdown_drain_bounded_against_retry_loop(fake_broker, config, monkeypatch, capsys):
+    """AC-1.4.5 régression : un envoi en pleine boucle de retries au moment de
+    l'arrêt ne fait pas déborder le drain borné — la cancellation n'est jamais
+    avalée par la boucle de retries, le pipeline revient vite et journalise
+    l'abandon des envois restants."""
+    episodes, _clients = fake_broker
+    monkeypatch.setattr(firebase_admin, "initialize_app", lambda credential=None, **kwargs: "fake-app")
+    monkeypatch.setattr("firebase_admin.credentials.Certificate", lambda path: "credential")
+    monkeypatch.setattr(
+        messaging,
+        "send",
+        lambda *a, **kw: (_ for _ in ()).throw(messaging.QuotaExceededError("ralenti")),
+    )
+    monkeypatch.setenv(CREDENTIALS_ENV, "unused")
+    monkeypatch.setattr("mqtt_notif.notifier.RETRY_BACKOFF_DELAYS_S", (3.0, 3.0, 3.0))
+    monkeypatch.setattr(main_module, "SHUTDOWN_TIMEOUT_S", 0.1)
+    episodes.append(
+        Episode(messages=[FakeMessage(b'{"valeur": "1"}')], drop=aiomqtt.MqttError("drop"))
+    )
+    notifier = Notifier(config.device_token)
+    stop = asyncio.Event()
+
+    task = asyncio.create_task(run_pipeline(config, notifier, stop))
+    seen = ""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        seen += capsys.readouterr().out
+        if "fcm send retry" in seen:
+            break
+        await asyncio.sleep(0.02)
+    stop.set()
+    start = time.monotonic()
+    await asyncio.wait_for(task, timeout=5)
+    elapsed = time.monotonic() - start
+
+    out = seen + capsys.readouterr().out
+    assert "fcm send retry" in out  # l'envoi était bien en pleine boucle de retries
+    assert "fcm sends abandoned" in out
+    assert "après 0.1s" in out
+    assert elapsed < 1.0  # jamais les 3s de backoff restant
 
 
 def test_main_returns_zero_on_valid_config(fake_broker, monkeypatch, tmp_path, capsys):
